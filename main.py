@@ -1,28 +1,4 @@
-"""
-CarAI v9.0 — Assistant IA CarEasy Bénin
-========================================
-CORRECTIONS v9 (par rapport à v6/v7) :
 
-1. BDD TOUJOURS INTERROGÉE
-   - SKIP_DB réduit à seulement : salutation, remerciement, aurevoir, bot_info, perso
-   - "general" et "faq" ne skipent plus la BDD si un domaine ou une ville est détectable
-   - Nouveau : _needs_db() — logique centralisée, lisible, testable
-
-2. CONTEXTE CONVERSATIONNEL FORT
-   - Si ctx["last_domaine"] existe, il est injecté automatiquement dans toute requête
-   - "Et il y a des entreprises ?" → ré-interroge la BDD avec le domaine du contexte
-   - Messages courts (<= 4 mots) avec contexte domaine → toujours recherche BDD
-
-3. PERSONALITÉ HUMAINE
-   - Prompt SYS v9 : direct, chaleureux, béninois, jamais robotique
-   - Fallback : variantes aléatoires, formulations naturelles
-   - Suppression définitive de "localhost" dans toutes les réponses
-
-4. APPRENTISSAGE NON SUPERVISÉ
-   - _track_query() enrichi avec taux de succès
-   - Feedback négatif → correction mémorisée et réutilisée
-   - Stats db_hits/db_misses pour monitorer
-"""
 
 import os, json, re, math, httpx, time, hashlib, random
 import redis.asyncio as aioredis
@@ -37,13 +13,13 @@ from collections import defaultdict
 load_dotenv()
 
 LARAVEL_BASE    = os.getenv("LARAVEL_API_URL",  "https://careasy26.alwaysdata.net/api")
-REDIS_URL       = os.getenv("REDIS_URL",        "redis://localhost:6379")
+REDIS_URL       = os.getenv("REDIS_URL",        "redis://default:AZExAAIncDE1M2I2MDYzOGQyYzg0ZTNiOTNhYzg4OWU5MjUzZTlhYnAxMzcxNjk@on-turtle-37169.upstash.io:6379")
 USE_NOMINATIM   = os.getenv("USE_NOMINATIM",    "true").lower() == "true"
 GOOGLE_MAPS_KEY = os.getenv("GOOGLE_MAPS_KEY",  "")
 OLLAMA_URL      = os.getenv("OLLAMA_URL",       "http://localhost:11434")
 OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL",     "llama3")
 USE_OLLAMA      = os.getenv("USE_OLLAMA",       "true").lower() == "true"
-SITE_URL        = os.getenv("FRONTEND_URL",     "https://careasy.bj")
+SITE_URL        = os.getenv("FRONTEND_URL",     "https://careasy.vercel.app")
 LEARN_FILE      = os.getenv("LEARN_FILE",       "/tmp/carai_learn_v9.json")
 
 app = FastAPI(title="CarAI v9.0", version="9.0.0", docs_url="/docs")
@@ -131,7 +107,35 @@ async def startup():
         except Exception as e:
             print(f"[CarAI] Ollama KO: {e}")
 
+    # BUG FIX #7 : tester la connectivite Laravel au demarrage
     print(f"[CarAI] v9.0 | {LARAVEL_BASE} | Ollama={'ON' if USE_OLLAMA else 'OFF'}")
+    try:
+        async with httpx.AsyncClient(timeout=8) as c:
+            r = await c.get(f"{LARAVEL_BASE}/ai/domaines")
+            if r.status_code == 200:
+                nb = len(r.json().get("data", []))
+                print(f"[CarAI] Laravel OK - {nb} domaines disponibles")
+            else:
+                print(f"[CarAI] ATTENTION: Laravel repond {r.status_code} sur /ai/domaines")
+    except Exception as e:
+        print(f"[CarAI] ATTENTION: Laravel inaccessible au demarrage: {e}")
+        print(f"[CarAI] Verifiez LARAVEL_API_URL={LARAVEL_BASE}")
+    try:
+        async with httpx.AsyncClient(timeout=8) as c:
+            # Tester avec coordonnees de Cotonou
+            r = await c.get(f"{LARAVEL_BASE}/ai/services/nearby",
+                          params={"lat": 6.3654, "lng": 2.4183, "radius": 50, "limit": 3})
+            if r.status_code == 200:
+                nb = len(r.json().get("data", []))
+                if nb > 0:
+                    print(f"[CarAI] BDD OK - {nb} services trouves pres de Cotonou")
+                else:
+                    print("[CarAI] ATTENTION: 0 services trouves pres de Cotonou")
+                    print("[CarAI] -> Verifiez que des entreprises ont status=validated ET des coordonnees GPS")
+            else:
+                print(f"[CarAI] ATTENTION: /ai/services/nearby repond {r.status_code}")
+    except Exception as e:
+        print(f"[CarAI] ATTENTION: Test services/nearby echoue: {e}")
 
 
 @app.on_event("shutdown")
@@ -217,11 +221,6 @@ def _confidence(message: str, intent: str) -> float:
         return max(0.1, min(1.0, _LEARN["pattern_scores"][key]["score"] / 5.0))
     n = len(_LEARN["intent_clusters"].get(intent, []))
     return 0.9 if n > 20 else (0.8 if n > 10 else 0.70)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  DOMAINES & VILLES
-# ═══════════════════════════════════════════════════════════════════════════════
 
 DOMAINES: Dict[str, List[str]] = {
     "Pneumatique / vulcanisation": [
@@ -779,16 +778,55 @@ async def api_nearby(
             if r.status_code == 200:
                 data = r.json().get("data", [])
                 _LEARN["stats"]["db_hits"] += 1
-                print(f"[DB] api_nearby({lat:.2f},{lng:.2f},{domaine}) -> {len(data)} résultats")
-                return sorted(data, key=lambda x: x.get("distance_km", 999))
+                print(f"[DB] api_nearby({lat:.2f},{lng:.2f},{domaine}) -> {len(data)} resultats")
+                # BUG FIX #2 : normaliser le champ domaine (peut etre un dict ou une string)
+                normalized = [_normalize_service(s) for s in data]
+                return sorted(normalized, key=lambda x: x.get("distance_km", 999))
     except Exception as e:
         print(f"[DB] api_nearby ERREUR: {e}")
     _LEARN["stats"]["db_misses"] += 1
     return []
 
 
+def _normalize_service(s: Dict) -> Dict:
+    """
+    BUG FIX #1 : Normalise un service venant de /ai/services
+    pour qu il ait le meme format que /ai/services/nearby.
+    /ai/services retourne entreprise avec : id, name, logo, call_phone,
+    whatsapp_phone, email, address, status
+    /ai/services/nearby retourne entreprise avec : id, name, latitude,
+    longitude, google_formatted_address, call_phone, whatsapp_phone,
+    status_online, logo
+    """
+    e = s.get("entreprise", {}) or {}
+    if isinstance(e, dict) and e.get("latitude") is not None:
+        # Deja au bon format (vient de nearby), juste normaliser domaine
+        s_copy = dict(s)
+        dom = s.get("domaine")
+        if isinstance(dom, dict):
+            s_copy["domaine"] = dom.get("name")
+        return s_copy
+    # Format venant de /ai/services - normaliser
+    s_copy = dict(s)
+    s_copy["entreprise"] = {
+        "id":                       e.get("id"),
+        "name":                     e.get("name"),
+        "latitude":                 e.get("latitude"),
+        "longitude":                e.get("longitude"),
+        "google_formatted_address": e.get("google_formatted_address") or e.get("address"),
+        "call_phone":               e.get("call_phone"),
+        "whatsapp_phone":           e.get("whatsapp_phone"),
+        "status_online":            e.get("status_online", True),
+        "logo":                     e.get("logo"),
+    }
+    dom = s.get("domaine")
+    if isinstance(dom, dict):
+        s_copy["domaine"] = dom.get("name")
+    return s_copy
+
+
 async def api_by_domaine(domaine: str, limit: int = 15) -> List[Dict]:
-    """Interroge la BDD Laravel par domaine (sans GPS)."""
+    """Interroge la BDD Laravel par domaine (sans GPS). BUG FIX #1 applique."""
     try:
         async with httpx.AsyncClient(timeout=15) as c:
             r = await c.get(
@@ -798,11 +836,33 @@ async def api_by_domaine(domaine: str, limit: int = 15) -> List[Dict]:
             if r.status_code == 200:
                 data = r.json().get("data", [])
                 _LEARN["stats"]["db_hits"] += 1
-                print(f"[DB] api_by_domaine({domaine}) -> {len(data)} résultats")
-                return data
+                print(f"[DB] api_by_domaine({domaine}) -> {len(data)} resultats")
+                # Normaliser le format pour qu il soit compatible avec clean_svc()
+                return [_normalize_service(s) for s in data]
     except Exception as e:
         print(f"[DB] api_by_domaine ERREUR: {e}")
     _LEARN["stats"]["db_misses"] += 1
+    return []
+
+
+async def api_services_all(domaine: Optional[str] = None, limit: int = 20) -> List[Dict]:
+    """
+    BUG FIX #4 : Fallback ultime — recupere tous les services valides
+    sans filtrage GPS, avec un rayon elargi.
+    Utilise quand api_nearby ET api_by_domaine retournent 0 resultats.
+    """
+    try:
+        params: Dict[str, Any] = {"limit": limit}
+        if domaine:
+            params["domaine"] = domaine
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(f"{LARAVEL_BASE}/ai/services", params=params)
+            if r.status_code == 200:
+                data = r.json().get("data", [])
+                print(f"[DB] api_services_all({domaine}) -> {len(data)} resultats")
+                return [_normalize_service(s) for s in data]
+    except Exception as e:
+        print(f"[DB] api_services_all ERREUR: {e}")
     return []
 
 
@@ -818,11 +878,25 @@ async def api_domaines() -> List[str]:
 
 
 def clean_svc(s: Dict) -> Dict:
-    e = s.get("entreprise", {})
+    """
+    BUG FIX #6 : Securise clean_svc pour gerer les deux formats
+    (venant de /nearby et de /services) apres normalisation.
+    """
+    e = s.get("entreprise") or {}
+    # Securiser distance_km (peut etre None, string ou float)
+    dist = s.get("distance_km")
+    try:
+        dist = round(float(dist), 1) if dist is not None else None
+    except (TypeError, ValueError):
+        dist = None
+    # Securiser le champ domaine (peut etre un dict ou une string)
+    domaine_val = s.get("domaine")
+    if isinstance(domaine_val, dict):
+        domaine_val = domaine_val.get("name")
     return {
         "id":                  s.get("id"),
         "name":                s.get("name"),
-        "domaine":             s.get("domaine"),
+        "domaine":             domaine_val,
         "price":               s.get("price"),
         "price_promo":         s.get("price_promo"),
         "is_price_on_request": s.get("is_price_on_request"),
@@ -830,13 +904,14 @@ def clean_svc(s: Dict) -> Dict:
         "is_open_24h":         s.get("is_always_open") or s.get("is_open_24h"),
         "start_time":          s.get("start_time"),
         "end_time":            s.get("end_time"),
-        "distance_km":         s.get("distance_km"),
+        "distance_km":         dist,
         "average_rating":      s.get("average_rating"),
         "total_reviews":       s.get("total_reviews"),
         "entreprise": {
             "id":             e.get("id"),
             "name":           e.get("name"),
-            "address":        e.get("google_formatted_address"),
+            # BUG FIX : lire address depuis google_formatted_address ou address
+            "address":        e.get("google_formatted_address") or e.get("address"),
             "latitude":       e.get("latitude"),
             "longitude":      e.get("longitude"),
             "call_phone":     e.get("call_phone"),
@@ -1263,55 +1338,87 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
     should_query_db = _needs_db(intent, domaine, location, ctx, wc)
 
     if should_query_db and not is_followup:
-        # Cas 1 : GPS disponible dans la requête courante
+        # ── CAS 1 : GPS disponible dans la requete courante ──────────────────
         if req.latitude and req.longitude:
             services = await api_nearby(
                 req.latitude, req.longitude, domaine, radius, limit=10
             )
+            # BUG FIX #5a : si nearby retourne rien avec GPS, elargir le rayon
+            if not services:
+                services = await api_nearby(
+                    req.latitude, req.longitude, domaine, 50, limit=10
+                )
+            # BUG FIX #5b : si toujours rien, fallback par domaine sans GPS
+            if not services and domaine:
+                services = await api_by_domaine(domaine, limit=15)
+            if not services:
+                services = await api_services_all(domaine, limit=15)
+            # Calculer l itineraire vers le premier resultat si GPS
             if services:
-                e0 = services[0].get("entreprise", {})
+                e0 = services[0].get("entreprise", {}) or {}
                 if e0.get("latitude") and e0.get("longitude"):
-                    d_km = haversine(
-                        req.latitude, req.longitude,
-                        float(e0["latitude"]), float(e0["longitude"])
-                    )
-                    mapurl    = map_link(
-                        req.latitude, req.longitude,
-                        float(e0["latitude"]), float(e0["longitude"])
-                    )
-                    itinerary = {
-                        "maps_url":    mapurl,
-                        "distance":    f"{d_km:.1f} km",
-                        "duration":    dur(d_km),
-                        "destination": e0.get("name", ""),
-                    }
+                    try:
+                        d_km = haversine(
+                            req.latitude, req.longitude,
+                            float(e0["latitude"]), float(e0["longitude"])
+                        )
+                        mapurl    = map_link(
+                            req.latitude, req.longitude,
+                            float(e0["latitude"]), float(e0["longitude"])
+                        )
+                        itinerary = {
+                            "maps_url":    mapurl,
+                            "distance":    f"{d_km:.1f} km",
+                            "duration":    dur(d_km),
+                            "destination": e0.get("name", ""),
+                        }
+                    except Exception:
+                        pass
 
-        # Cas 2 : GPS mémorisé dans le contexte (si pas de GPS dans la requête)
+        # ── CAS 2 : GPS memorise dans le contexte ────────────────────────────
         elif ctx.get("last_lat") and ctx.get("last_lng") and not location:
             services = await api_nearby(
                 float(ctx["last_lat"]), float(ctx["last_lng"]),
                 domaine, radius, limit=10
             )
+            # BUG FIX #5c : fallback si rien
+            if not services and domaine:
+                services = await api_by_domaine(domaine, limit=15)
+            if not services:
+                services = await api_services_all(domaine, limit=15)
 
-        # Cas 3 : Ville mentionnée → géocodage puis recherche
+        # ── CAS 3 : Ville mentionnee → geocodage puis recherche ──────────────
         elif location:
             coords = await geocode(location)
             if coords:
                 services = await api_nearby(
                     coords[0], coords[1], domaine, radius, limit=10
                 )
-                # Élargir automatiquement si aucun résultat
+                # Elargir automatiquement si aucun resultat
                 if not services:
                     services = await api_nearby(
-                        coords[0], coords[1], domaine, radius * 2, limit=10
+                        coords[0], coords[1], domaine, radius * 3, limit=10
                     )
-            # Fallback par domaine si toujours rien
+            # BUG FIX #5d : Fallback par domaine si toujours rien
             if not services and domaine:
                 services = await api_by_domaine(domaine, limit=15)
+            # BUG FIX #5e : Dernier recours - tous les services
+            if not services:
+                services = await api_services_all(domaine, limit=15)
 
-        # Cas 4 : Seulement un domaine détecté → recherche nationale
+        # ── CAS 4 : Seulement un domaine detecte → recherche nationale ───────
         elif domaine:
             services = await api_by_domaine(domaine, limit=15)
+            # BUG FIX #5f : si api_by_domaine retourne rien, essayer api_services_all
+            if not services:
+                services = await api_services_all(domaine, limit=15)
+                print(f"[DB] Fallback api_services_all pour domaine={domaine} -> {len(services)}")
+
+        # ── CAS 5 (NOUVEAU) : Aucun critere mais contexte domaine present ────
+        # BUG FIX #5g : Si l utilisateur pose une question generique avec un
+        # contexte domaine memorise, on re-interroge la BDD
+        elif ctx.get("last_domaine") and intent not in {"faq", "general"}:
+            services = await api_by_domaine(ctx["last_domaine"], limit=10)
 
     _track_query(domaine, location, len(services))
 
