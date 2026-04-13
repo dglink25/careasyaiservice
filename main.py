@@ -1,6 +1,5 @@
-
-
 import os, json, re, math, httpx, time, hashlib, random
+import unicodedata
 import redis.asyncio as aioredis
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,7 +21,7 @@ USE_OLLAMA      = os.getenv("USE_OLLAMA",       "true").lower() == "true"
 SITE_URL        = os.getenv("FRONTEND_URL",     "https://careasy.vercel.app")
 LEARN_FILE      = os.getenv("LEARN_FILE",       "/tmp/carai_learn_v9.json")
 
-app = FastAPI(title="CarAI v9.0", version="9.0.0", docs_url="/docs")
+app = FastAPI(title="CarAI v9.1", version="9.1.0", docs_url="/docs")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
@@ -45,6 +44,29 @@ _LEARN: Dict[str, Any] = {
         "feedback_pos": 0, "feedback_neg": 0,
     },
 }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  UTILITAIRE — Normalisation texte
+#  FIX #1 : apostrophes Unicode (\u2019 etc.) → ASCII, accents conservés
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def normalize_text(text: str) -> str:
+    """
+    Normalise un texte pour la comparaison :
+    - Apostrophes typographiques → apostrophe ASCII '
+    - Tirets spéciaux → tiret ASCII -
+    - Minuscules
+    - NFC unicode (évite les doubles encodages)
+    """
+    text = unicodedata.normalize("NFC", text)
+    # Toutes les variantes d'apostrophe → '
+    text = text.replace("\u2019", "'").replace("\u2018", "'") \
+               .replace("\u02BC", "'").replace("\u0060", "'") \
+               .replace("\u00B4", "'")
+    # Tirets longs → tiret court
+    text = text.replace("\u2013", "-").replace("\u2014", "-")
+    return text.lower()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -103,39 +125,52 @@ async def startup():
                 if r.status_code == 200:
                     models = [m["name"] for m in r.json().get("models", [])]
                     ok = any(OLLAMA_MODEL in m for m in models)
-                    print(f"[CarAI] Ollama '{OLLAMA_MODEL}' {'OK' if ok else 'ABSENT'}")
+                    print(f"[CarAI] Ollama '{OLLAMA_MODEL}' {'OK' if ok else 'ABSENT — mode fallback actif'}")
+                else:
+                    print(f"[CarAI] Ollama KO (HTTP {r.status_code}) — mode fallback actif")
         except Exception as e:
-            print(f"[CarAI] Ollama KO: {e}")
+            print(f"[CarAI] Ollama KO ({e}) — mode fallback actif")
 
-    # BUG FIX #7 : tester la connectivite Laravel au demarrage
-    print(f"[CarAI] v9.0 | {LARAVEL_BASE} | Ollama={'ON' if USE_OLLAMA else 'OFF'}")
+    print(f"[CarAI] v9.1 | {LARAVEL_BASE} | Ollama={'ON' if USE_OLLAMA else 'OFF'}")
+
+    # Test connectivité Laravel
     try:
         async with httpx.AsyncClient(timeout=8) as c:
             r = await c.get(f"{LARAVEL_BASE}/ai/domaines")
             if r.status_code == 200:
                 nb = len(r.json().get("data", []))
-                print(f"[CarAI] Laravel OK - {nb} domaines disponibles")
+                print(f"[CarAI] Laravel OK — {nb} domaines disponibles")
             else:
-                print(f"[CarAI] ATTENTION: Laravel repond {r.status_code} sur /ai/domaines")
+                print(f"[CarAI] ATTENTION: Laravel répond {r.status_code} sur /ai/domaines")
     except Exception as e:
-        print(f"[CarAI] ATTENTION: Laravel inaccessible au demarrage: {e}")
-        print(f"[CarAI] Verifiez LARAVEL_API_URL={LARAVEL_BASE}")
+        print(f"[CarAI] ATTENTION: Laravel inaccessible au démarrage: {e}")
+
+    # Test services nearby
     try:
         async with httpx.AsyncClient(timeout=8) as c:
-            # Tester avec coordonnees de Cotonou
-            r = await c.get(f"{LARAVEL_BASE}/ai/services/nearby",
-                          params={"lat": 6.3654, "lng": 2.4183, "radius": 50, "limit": 3})
+            r = await c.get(
+                f"{LARAVEL_BASE}/ai/services/nearby",
+                params={"lat": 6.3654, "lng": 2.4183, "radius": 50, "limit": 3}
+            )
             if r.status_code == 200:
                 nb = len(r.json().get("data", []))
-                if nb > 0:
-                    print(f"[CarAI] BDD OK - {nb} services trouves pres de Cotonou")
-                else:
-                    print("[CarAI] ATTENTION: 0 services trouves pres de Cotonou")
-                    print("[CarAI] -> Verifiez que des entreprises ont status=validated ET des coordonnees GPS")
+                print(f"[CarAI] BDD OK — {nb} services trouvés près de Cotonou")
+                if nb == 0:
+                    print("[CarAI] ATTENTION: 0 services — vérifiez status=validated ET coords GPS")
             else:
-                print(f"[CarAI] ATTENTION: /ai/services/nearby repond {r.status_code}")
+                print(f"[CarAI] ATTENTION: /ai/services/nearby répond {r.status_code}")
     except Exception as e:
-        print(f"[CarAI] ATTENTION: Test services/nearby echoue: {e}")
+        print(f"[CarAI] ATTENTION: Test services/nearby échoué: {e}")
+
+    # Test services sans GPS (fallback)
+    try:
+        async with httpx.AsyncClient(timeout=8) as c:
+            r = await c.get(f"{LARAVEL_BASE}/ai/services", params={"limit": 3})
+            if r.status_code == 200:
+                nb = len(r.json().get("data", []))
+                print(f"[CarAI] Fallback /ai/services OK — {nb} services disponibles")
+    except Exception as e:
+        print(f"[CarAI] ATTENTION: Test /ai/services échoué: {e}")
 
 
 @app.on_event("shutdown")
@@ -157,7 +192,8 @@ def _load_learn():
             print(f"[Learn] {len(_LEARN['pattern_scores'])} patterns, "
                   f"{len(_LEARN['faq_corrections'])} corrections")
     except Exception as e:
-        print(f"[Learn] Chargement: {e}")
+        print(f"[Learn] Chargement ignoré (fichier absent ou corrompu): {e}")
+        # FIX #2 : Ne pas crasher si le fichier est absent ou corrompu
 
 
 def _save_learn():
@@ -165,11 +201,11 @@ def _save_learn():
         with open(LEARN_FILE, "w", encoding="utf-8") as f:
             json.dump(_LEARN, f, ensure_ascii=False, indent=2, default=str)
     except Exception as e:
-        print(f"[Learn] Sauvegarde: {e}")
+        print(f"[Learn] Sauvegarde échouée (non bloquant): {e}")
 
 
 def _h(text: str) -> str:
-    return hashlib.md5(text.lower().strip().encode()).hexdigest()[:12]
+    return hashlib.md5(normalize_text(text).encode()).hexdigest()[:12]
 
 
 def _score_update(message: str, reply: str, score: int):
@@ -201,7 +237,6 @@ def _cluster_intent(intent: str, message: str):
 
 
 def _track_query(domaine: Optional[str], location: Optional[str], found: int):
-    """Mémorise les combinaisons domaine/ville fréquentes pour l'apprentissage."""
     key = f"{domaine or 'any'}|{location or 'any'}"
     q   = _LEARN["query_stats"].setdefault(key, {"count": 0, "hits": 0})
     q["count"] += 1
@@ -222,80 +257,126 @@ def _confidence(message: str, intent: str) -> float:
     n = len(_LEARN["intent_clusters"].get(intent, []))
     return 0.9 if n > 20 else (0.8 if n > 10 else 0.70)
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DOMAINES
+#  FIX #1 : Clés normalisées (apostrophes ASCII) + mots-clés enrichis
+# ═══════════════════════════════════════════════════════════════════════════════
+
 DOMAINES: Dict[str, List[str]] = {
     "Pneumatique / vulcanisation": [
-        "pneu", "pneus", "vulcanis", "crevaison", "crevé", "roue crevée",
-        "chambre à air", "pneumatique", "gomme", "tubeless",
+        "pneu", "pneus", "vulcanis", "crevaison", "creve", "roue crevee",
+        "chambre a air", "pneumatique", "gomme", "tubeless",
+        "pneu creve", "pneu plat",
     ],
-    "Garage mécanique": [
-        "garage", "mécanicien", "mécani", "réparer", "réparation", "panne",
-        "moteur", "boîte vitesse", "frein", "embrayage", "courroie",
-        "révision", "entretien", "contrôle", "mechanic", "repair",
+    "Garage mecanique": [
+        "garage", "mecanicien", "mecani", "reparer", "reparation", "panne",
+        "moteur", "boite vitesse", "frein", "embrayage", "courroie",
+        "revision", "entretien", "controle", "mechanic", "repair",
+        "voiture en panne", "ma voiture", "mon vehicule",
     ],
     "Lavage automobile": [
-        "lavage", "laver voiture", "carwash", "car wash", "nettoyage voiture",
-        "polissage", "lustrage",
+        "lavage", "carwash", "car wash", "nettoyage voiture",
+        "polissage", "lustrage", "laver voiture", "laver ma voiture",
+        "laver auto", "lavage auto", "lavage voiture",
     ],
-    "Électricien auto": [
-        "électricien auto", "batterie voiture", "alternateur", "démarreur auto",
-        "câblage", "phare voiture", "electrician auto",
+    "Electricien auto": [
+        "electricien auto", "batterie voiture", "alternateur", "demarreur auto",
+        "cablage", "phare voiture", "electrician auto", "probleme electrique",
+        "electricien", "batterie",
     ],
     "Climatisation auto": [
-        "climatisation", "clim voiture", "air conditionné voiture", "recharge clim",
+        "climatisation", "clim voiture", "air conditionne voiture", "recharge clim",
+        "clim", "ac voiture", "recharge climatisation",
     ],
     "Peinture auto": [
         "peinture voiture", "rayure carrosserie", "retouche peinture", "vernis voiture",
     ],
-    "Tôlerie": ["tôlerie", "carrosserie", "bosselage", "débosselage", "dent voiture"],
-    "Dépannage / remorquage": [
-        "dépannage", "dépanneur", "remorquage", "voiture en panne",
-        "sos auto", "assistance routière", "towing",
+    "Tolerie": [
+        "tolerie", "tôlerie", "carrosserie", "bosselage", "debosselage", "dent voiture",
     ],
-    "Changement d'huile": ["vidange", "huile moteur", "filtre huile", "oil change"],
+    "Depannage / remorquage": [
+        "depannage", "depanneur", "remorquage", "voiture en panne",
+        "sos auto", "assistance routiere", "towing", "urgence voiture",
+        "en panne", "tombe en panne",
+    ],
+    "Changement d'huile": [
+        "vidange", "huile moteur", "filtre huile", "oil change",
+        "changer huile", "faire vidange",
+    ],
     "Diagnostic automobile": [
         "diagnostic", "scanner voiture", "valise diagnostic", "code erreur voiture",
-        "voyant allumé", "check engine", "obd",
+        "voyant allume", "check engine", "obd", "voyant rouge",
     ],
     "Station d'essence": [
         "essence", "carburant", "gasoil", "diesel", "station service",
-        "faire le plein", "pompe essence",
+        "faire le plein", "pompe essence", "station d'essence",
+        "station essence", "plein", "sans plomb",
     ],
-    "Location de voitures": ["location voiture", "louer voiture", "voiture de location"],
-    "Assurance automobile": ["assurance auto", "sinistre auto", "police assurance"],
-    "École de conduite": ["permis de conduire", "auto-école", "autoecole", "driving school"],
-    "Vente de pièces détachées": [
-        "pièces détachées", "spare part", "plaquette frein", "disque frein",
-        "bougie", "filtre voiture", "pièce voiture",
+    "Location de voitures": [
+        "location voiture", "louer voiture", "voiture de location",
+        "louer une voiture",
     ],
-    "Réparation moto": ["moto", "zémidjan", "zem", "zemidjan", "scooter", "moto taxi"],
+    "Assurance automobile": [
+        "assurance auto", "sinistre auto", "police assurance",
+        "assurance voiture",
+    ],
+    "Ecole de conduite": [
+        "permis de conduire", "auto-ecole", "autoecole", "driving school",
+        "permis conduire", "apprendre conduire",
+    ],
+    "Vente de pieces detachees": [
+        "pieces detachees", "spare part", "plaquette frein", "disque frein",
+        "bougie", "filtre voiture", "piece voiture", "pieces auto",
+    ],
+    "Reparation moto": [
+        "moto", "zemidjan", "zem", "scooter", "moto taxi",
+        "reparer moto", "moto en panne",
+    ],
     "Vente de voitures": [
         "acheter voiture", "achat voiture", "vente voiture", "concessionnaire",
-        "voiture d'occasion", "voiture neuve",
+        "voiture d'occasion", "voiture neuve", "occasion",
     ],
-    "Maintenance poids lourds": ["poids lourd", "camion", "semi-remorque", "gros porteur"],
-    "Vente de motos": ["acheter moto", "vente moto", "moto neuve", "moto occasion"],
-    "Vente de vélos / entretien": ["vélo", "bicyclette", "vtt", "réparation vélo"],
+    "Maintenance poids lourds": [
+        "poids lourd", "camion", "semi-remorque", "gros porteur",
+    ],
+    "Vente de motos": [
+        "acheter moto", "vente moto", "moto neuve", "moto occasion",
+    ],
+    "Vente de velos / entretien": [
+        "velo", "bicyclette", "vtt", "reparation velo",
+    ],
 }
 
-KW2DOM: Dict[str, str] = {
-    kw.lower(): dom for dom, kws in DOMAINES.items() for kw in kws
-}
+# FIX #1 : Construire KW2DOM avec clés normalisées (apostrophes ASCII, minuscules)
+KW2DOM: Dict[str, str] = {}
+for dom, kws in DOMAINES.items():
+    dom_normalized = normalize_text(dom)
+    for kw in kws:
+        KW2DOM[normalize_text(kw)] = dom
+
+# FIX #1b : Ajouter aussi les noms de domaines eux-mêmes comme mots-clés
+# (ex: "station d'essence" tapé par l'utilisateur doit matcher)
+for dom in DOMAINES.keys():
+    dom_n = normalize_text(dom)
+    if dom_n not in KW2DOM:
+        KW2DOM[dom_n] = dom
 
 VILLES = [
     "Cotonou", "Porto-Novo", "Parakou", "Abomey", "Bohicon", "Calavi",
     "Ouidah", "Natitingou", "Lokossa", "Djougou", "Kandi", "Malanville",
-    "Nikki", "Savalou", "Savè", "Tchaourou", "Bassila", "Dogbo", "Aplahoue",
-    "Dassa-Zoumé", "Abomey-Calavi", "Allada", "Kpomassè", "Zè",
-    "Adjarra", "Adjohoun", "Sèmè-Kpodji", "Godomey", "Fidjrossè",
-    "Akpakpa", "Cadjèhoun", "Gbégamey", "Haie Vive", "Vèdoko",
-    "Zogbo", "Agla", "Jéricho", "Mènontin", "Akogbato", "Cocotiers",
-    "Dantokpa", "Houéyiho", "Pobe", "Ketou", "Sakete", "Ifangni",
-    "Avrankou", "Dangbo", "Grand-Popo", "Athiémé", "Come",
+    "Nikki", "Savalou", "Save", "Tchaourou", "Bassila", "Dogbo", "Aplahoue",
+    "Dassa-Zoume", "Abomey-Calavi", "Allada", "Kpomasse", "Ze",
+    "Adjarra", "Adjohoun", "Seme-Kpodji", "Godomey", "Fidjrosse",
+    "Akpakpa", "Cadjehoun", "Gbegamey", "Haie Vive", "Vedoko",
+    "Zogbo", "Agla", "Jericho", "Menontin", "Akogbato", "Cocotiers",
+    "Dantokpa", "Houeyiho", "Pobe", "Ketou", "Sakete", "Ifangni",
+    "Avrankou", "Dangbo", "Grand-Popo", "Athieme", "Come",
 ]
 
 STOP_LOC = {
-    "moi", "vous", "nous", "lui", "elle", "eux", "cela", "ça", "toi",
-    "plus", "moins", "tout", "rien", "ici", "là", "bien", "mal",
+    "moi", "vous", "nous", "lui", "elle", "eux", "cela", "ca", "toi",
+    "plus", "moins", "tout", "rien", "ici", "la", "bien", "mal",
     "savoir", "faire", "chercher", "trouver", "aide", "careasy", "carai",
 }
 
@@ -306,9 +387,9 @@ STOP_LOC = {
 
 FAQ: List[Dict] = [
     {
-        "tags": ["inscription", "créer compte", "devenir prestataire", "inscrire entreprise",
-                 "rejoindre", "soumettre dossier", "enregistrer entreprise", "créer une entreprise",
-                 "comment créer entreprise"],
+        "tags": ["inscription", "creer compte", "devenir prestataire", "inscrire entreprise",
+                 "rejoindre", "soumettre dossier", "enregistrer entreprise", "creer une entreprise",
+                 "comment creer entreprise"],
         "content": (
             "Pour inscrire votre entreprise sur CarEasy : "
             "1) Créez un compte avec votre email ou téléphone. "
@@ -319,23 +400,23 @@ FAQ: List[Dict] = [
         )
     },
     {
-        "tags": ["documents requis", "ifu", "rccm", "certificat", "pièces dossier"],
+        "tags": ["documents requis", "ifu", "rccm", "certificat", "pieces dossier"],
         "content": "Documents requis : IFU, RCCM, certificat d'immatriculation. Formats : PDF, JPG, PNG — max 5 Mo chacun."
     },
     {
-        "tags": ["validation", "délai validation", "dossier en attente"],
+        "tags": ["validation", "delai validation", "dossier en attente"],
         "content": "La validation prend 24 à 48 heures ouvrables. Vous êtes notifié par email et SMS."
     },
     {
-        "tags": ["dossier rejeté", "refus", "pourquoi rejeté"],
+        "tags": ["dossier rejete", "refus", "pourquoi rejete"],
         "content": "En cas de refus, la raison est précisée dans la notification. Causes fréquentes : documents illisibles ou informations incomplètes. Vous pouvez corriger et soumettre à nouveau."
     },
     {
-        "tags": ["mot de passe oublié", "réinitialiser", "forgot password", "reset"],
+        "tags": ["mot de passe oublie", "reinitialiser", "forgot password", "reset"],
         "content": "Pour réinitialiser votre mot de passe : cliquez Mot de passe oublié, entrez votre email ou téléphone, saisissez le code OTP à 6 chiffres valable 5 minutes, puis définissez votre nouveau mot de passe."
     },
     {
-        "tags": ["rendez-vous", "prendre rdv", "réserver", "booking"],
+        "tags": ["rendez-vous", "prendre rdv", "reserver", "booking"],
         "content": "Pour prendre un rendez-vous : ouvrez la fiche d'un service, cliquez Prendre RDV, choisissez la date et le créneau, confirmez. Le prestataire confirme ensuite avec notification à chaque étape."
     },
     {
@@ -358,7 +439,7 @@ FAQ: List[Dict] = [
         )
     },
     {
-        "tags": ["essai gratuit", "trial", "30 jours", "période essai"],
+        "tags": ["essai gratuit", "trial", "30 jours", "periode essai"],
         "content": "L'essai gratuit de 30 jours se déclenche automatiquement à la validation. Il inclut 3 services, visibilité clients et gestion des RDV. Un plan payant est requis après les 30 jours."
     },
     {
@@ -366,26 +447,27 @@ FAQ: List[Dict] = [
         "content": "Paiement via FedaPay : Orange Money, MTN Money, Moov Money ou carte bancaire. Allez dans Abonnements, choisissez votre plan et payez. Une facture est envoyée par email."
     },
     {
-        "tags": ["support", "aide", "problème", "bug", "contacter careasy"],
+        "tags": ["support", "aide", "probleme", "bug", "contacter careasy"],
         "content": "Support CarEasy : support@careasy.bj ou via WhatsApp sur le site. Disponible du lundi au vendredi de 8h à 18h."
     },
     {
-        "tags": ["créer service", "ajouter service", "publier service"],
+        "tags": ["creer service", "ajouter service", "publier service"],
         "content": "Pour créer un service : Espace prestataire, Mes services, Ajouter. Renseignez nom, domaine, prix ou sur devis, horaires et photos. Pendant l'essai : 3 services maximum."
     },
     {
-        "tags": ["position gps", "géolocalisation", "localisation"],
+        "tags": ["position gps", "geolocalisation", "localisation"],
         "content": "Activez la géolocalisation pour voir les prestataires proches de vous. Ou mentionnez votre quartier ou votre ville directement dans le message."
     },
     {
-        "tags": ["laisser avis", "noter", "évaluer", "review", "donner note"],
+        "tags": ["laisser avis", "noter", "evaluer", "review", "donner note"],
         "content": "Après une prestation : Mes rendez-vous, onglet Terminés, Laisser un avis. Note de 1 à 5 étoiles avec commentaire optionnel."
     },
 ]
 
 
 def faq_lookup(text: str) -> Optional[str]:
-    t          = text.lower()
+    # FIX #1 : Normaliser le texte avant recherche
+    t          = normalize_text(text)
     correction = _correction(text)
     if correction:
         return correction
@@ -393,7 +475,7 @@ def faq_lookup(text: str) -> Optional[str]:
     for entry in FAQ:
         score = sum(
             (2 if len(tag) > 15 else 1)
-            for tag in entry["tags"] if tag in t
+            for tag in entry["tags"] if normalize_text(tag) in t
         )
         if score > best_score:
             best_score, best = score, entry["content"]
@@ -405,8 +487,8 @@ def faq_lookup(text: str) -> Optional[str]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def detect_lang(text: str) -> str:
-    t  = text.lower()
-    for m in ["mɛ̌", "ɖò", "nɔ ", "bló", "wɛ ", "alɔ", "aca"]:
+    t  = normalize_text(text)
+    for m in ["me\u030c", "\u0256o\u0300", "n\u0254 ", "blo\u0301", "we\u0300 ", "al\u0254", "aca"]:
         if m in t:
             return "fon"
     fr = sum(1 for w in [
@@ -422,7 +504,12 @@ def detect_lang(text: str) -> str:
 
 
 def extract_domaine(text: str) -> Optional[str]:
-    t = text.lower()
+    """
+    FIX #1 : Normalise le texte avant extraction pour gérer toutes les
+    variantes d'apostrophes et de caractères spéciaux.
+    """
+    t = normalize_text(text)
+    # Trier par longueur décroissante pour matcher les mots-clés les plus longs d'abord
     for kw in sorted(KW2DOM.keys(), key=len, reverse=True):
         if kw in t:
             return KW2DOM[kw]
@@ -430,118 +517,127 @@ def extract_domaine(text: str) -> Optional[str]:
 
 
 def extract_location(text: str) -> Optional[str]:
-    t = text.lower()
+    """
+    FIX #3 : Normalise le texte pour matcher les villes avec accents ou sans.
+    """
+    t = normalize_text(text)
     for v in sorted(VILLES, key=len, reverse=True):
-        if v.lower() in t:
+        if normalize_text(v) in t:
             return v
-    geo = ["à ", "au ", "en ", "vers ", "près de ", "autour de ", "quartier ", "zone "]
+    geo = ["a ", "au ", "en ", "vers ", "pres de ", "autour de ", "quartier ", "zone "]
     if not any(g in t for g in geo):
         return None
     for pat in [
-        r"(?:à|au|en|vers|près de|autour de)\s+([A-ZÀ-Ÿa-zà-ÿ][a-zà-ÿ\-]{2,}(?:\s+[A-Za-zà-ÿ\-]+)?)",
+        r"(?:à|au|en|vers|près de|autour de|a |pres de)\s+([A-ZÀ-Ÿa-zà-ÿ][a-zà-ÿ\-]{2,}(?:\s+[A-Za-zà-ÿ\-]+)?)",
         r"(?:quartier|commune de|zone de?)\s+([A-ZÀ-Ÿa-zà-ÿ][a-zà-ÿ\-]{2,}(?:\s+[A-Za-zà-ÿ\-]+)?)",
     ]:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
             c = m.group(1).strip()
-            if len(c) > 2 and c.lower() not in STOP_LOC:
+            if len(c) > 2 and normalize_text(c) not in STOP_LOC:
                 return c
     return None
 
 
 def extract_radius(text: str) -> float:
-    m = re.search(r"(\d+)\s*km", text.lower())
+    m = re.search(r"(\d+)\s*km", normalize_text(text))
     if m:
         return min(float(m.group(1)), 100)
-    return 10 if any(w in text.lower() for w in ["proche", "près", "coin"]) else 20
+    return 10 if any(w in normalize_text(text) for w in ["proche", "pres", "coin"]) else 20
 
 
 def _needs_db(intent: str, domaine: Optional[str], location: Optional[str],
               ctx: Dict, wc: int) -> bool:
     """
-    Décide si on doit interroger la BDD.
-    RÈGLE : interroger SAUF si c'est une salutation/politesse pure sans contexte.
+    FIX #4 : Logique élargie — interroger la BDD dans plus de cas.
+    La règle est : NE PAS interroger seulement pour les salutations/politesses pures.
     """
     # Jamais pour les intents purement conversationnels
     HARD_SKIP = {"salutation", "remerciement", "aurevoir", "bot_info", "perso"}
     if intent in HARD_SKIP:
         return False
 
-    # Toujours si un domaine ou une ville est détectée dans le message
+    # Toujours si domaine ou ville détectée dans le message courant
     if domaine or location:
         return True
 
-    # Toujours si on a un contexte domaine (continuation de conversation)
-    if ctx.get("last_domaine"):
+    # Toujours si contexte domaine ou GPS mémorisé
+    if ctx.get("last_domaine") or ctx.get("last_lat"):
         return True
 
-    # Toujours pour "urgence" et "recherche"
+    # Toujours pour urgence et recherche
     if intent in {"urgence", "recherche"}:
         return True
 
-    # Pour faq/general : interroger si on a un contexte GPS
-    if ctx.get("last_lat") and ctx.get("last_lng"):
+    # FIX #4 : Pour les messages généraux suffisamment longs, interroger aussi
+    # Ex: "tu as des garages ?" → intent=general mais mérite une réponse BDD
+    if intent == "general" and wc >= 4:
+        return True
+
+    # Pour FAQ avec contexte services (ex: "combien ça coûte ?" après une recherche)
+    if intent == "faq" and ctx.get("last_services"):
         return True
 
     return False
 
 
 def intent_classify(text: str, ctx: Dict) -> str:
-    t  = text.lower().strip()
+    # FIX #1 : Normaliser pour la classification
+    t  = normalize_text(text)
     wc = len(t.split())
 
     # Salutations strictes
-    SAL = ["bonjour", "bonsoir", "salut", "hello", "hi ", "salam", "alafia", "bonne journée"]
+    SAL = ["bonjour", "bonsoir", "salut", "hello", "hi ", "salam", "alafia", "bonne journee"]
     if any(s in t for s in SAL) and wc <= 5:
         return "salutation"
 
     if any(s in t for s in ["merci", "thank you", "thanks"]) and wc <= 6:
         return "remerciement"
 
-    if any(s in t for s in ["au revoir", "bye", "à bientôt", "tchao"]) and wc <= 5:
+    if any(s in t for s in ["au revoir", "bye", "a bientot", "tchao"]) and wc <= 5:
         return "aurevoir"
 
     if any(s in t for s in [
         "comment tu t'appelle", "qui es-tu", "c'est quoi careasy",
-        "c'est quoi carai", "que peux-tu faire", "tu es qui", "présente-toi"
+        "c'est quoi carai", "que peux-tu faire", "tu es qui", "presente-toi",
+        "qu'est-ce que careasy", "kesako careasy",
     ]):
         return "bot_info"
 
-    if any(s in t for s in ["comment tu vas", "tu vas bien", "ça va", "ca va"]) and wc <= 5:
+    if any(s in t for s in ["comment tu vas", "tu vas bien", "ca va", "ca va"]) and wc <= 5:
         return "perso"
 
-    # FAQ keywords
+    # FAQ keywords — normalisés
     FAQ_KW = [
-        "comment créer", "comment modifier", "comment supprimer", "comment payer",
+        "comment creer", "comment modifier", "comment supprimer", "comment payer",
         "comment annuler", "comment prendre", "comment envoyer", "comment activer",
-        "comment ajouter", "comment inscrire", "comment fonctionne", "comment ça",
-        "qu'est-ce que", "ça fonctionne", "devenir prestataire", "inscrire mon entreprise",
+        "comment ajouter", "comment inscrire", "comment fonctionne", "comment ca",
+        "qu'est-ce que", "ca fonctionne", "devenir prestataire", "inscrire mon entreprise",
         "rejoindre careasy", "mot de passe", "abonnement", "paiement", "fedapay",
-        "essai gratuit", "rendez-vous", "prendre rdv", "créer service", "modifier service",
+        "essai gratuit", "rendez-vous", "prendre rdv", "creer service", "modifier service",
         "plan essenti", "plan profes", "plan premium", "tarif", "document requis",
         "ifu", "rccm", "certificat", "support careasy", "contacter careasy",
-        "créer une entreprise", "inscrire entreprise",
+        "creer une entreprise", "inscrire entreprise",
     ]
     if sum(1 for kw in FAQ_KW if kw in t) >= 1:
-        # Si on a aussi un domaine/ville → priorité recherche
         if extract_domaine(text) or extract_location(text):
             return "recherche"
         return "faq"
 
-    # Suivi conversationnel — messages courts faisant référence à des services déjà présentés
+    # Suivi conversationnel
     if ctx.get("last_services"):
         RANKS = [
-            "premier", "deuxième", "troisième", "1er", "2ème", "3ème",
-            "numéro 1", "numéro 2", "le 1", "le 2", "le 3"
+            "premier", "deuxieme", "troisieme", "1er", "2eme", "3eme",
+            "numero 1", "numero 2", "le 1", "le 2", "le 3"
         ]
         VAGUE = [
-            "celui-là", "cet endroit", "ce prestataire",
-            "cette entreprise", "là-bas", "ce garage"
+            "celui-la", "cet endroit", "ce prestataire",
+            "cette entreprise", "la-bas", "ce garage"
         ]
         FKWS = [
-            "numéro", "contact", "appeler", "whatsapp", "téléphone",
-            "adresse", "situé", "localisation", "prix", "combien",
-            "horaire", "ouvre", "itinéraire", "aller", "route"
+            "numero", "contact", "appeler", "whatsapp", "telephone",
+            "adresse", "situe", "localisation", "prix", "combien",
+            "horaire", "ouvre", "itineraire", "aller", "route"
         ]
         IMPLICIT_WORDS = [
             "et ", "eux", "elles", "ils", "leur", "leurs",
@@ -555,15 +651,15 @@ def intent_classify(text: str, ctx: Dict) -> str:
         is_implicit = wc <= 8 and any(w in t for w in IMPLICIT_WORDS)
 
         if is_rank or is_vague or is_short or is_implicit:
-            if any(f in t for f in ["numéro", "contact", "appeler", "whatsapp", "téléphone"]):
+            if any(f in t for f in ["numero", "contact", "appeler", "whatsapp", "telephone"]):
                 return "followup_contact"
-            if any(f in t for f in ["adresse", "situé", "localisation", "où sont", "où est"]):
+            if any(f in t for f in ["adresse", "situe", "localisation", "ou sont", "ou est"]):
                 return "followup_adresse"
             if any(f in t for f in ["prix", "combien", "tarif"]):
                 return "followup_prix"
-            if any(f in t for f in ["horaire", "ouvre", "fermé"]):
+            if any(f in t for f in ["horaire", "ouvre", "ferme"]):
                 return "followup_horaires"
-            if any(f in t for f in ["itinéraire", "aller", "route", "chemin"]):
+            if any(f in t for f in ["itineraire", "aller", "route", "chemin"]):
                 return "followup_itineraire"
             return "followup_info"
 
@@ -581,39 +677,39 @@ def intent_classify(text: str, ctx: Dict) -> str:
 
 
 def resolve_ref(text: str, ctx: Dict) -> Optional[Dict]:
-    t    = text.lower()
+    t    = normalize_text(text)
     svcs = ctx.get("last_services", [])
     if not svcs:
         return None
 
     RANKS = {
-        1: ["premier", "1er", "numéro 1", "le 1", "première", "#1"],
-        2: ["deuxième", "2ème", "numéro 2", "le 2", "#2", "second"],
-        3: ["troisième", "3ème", "numéro 3", "le 3"],
-        4: ["quatrième", "4ème", "le 4"],
-        5: ["cinquième", "5ème", "le 5"],
+        1: ["premier", "1er", "numero 1", "le 1", "premiere", "#1"],
+        2: ["deuxieme", "2eme", "numero 2", "le 2", "#2", "second"],
+        3: ["troisieme", "3eme", "numero 3", "le 3"],
+        4: ["quatrieme", "4eme", "le 4"],
+        5: ["cinquieme", "5eme", "le 5"],
     }
     for rank, patterns in RANKS.items():
         if any(p in t for p in patterns):
             return svcs[rank - 1] if rank - 1 < len(svcs) else None
 
     VAGUE = [
-        "celui-là", "cet endroit", "ce prestataire",
-        "cette entreprise", "là-bas", "ce garage"
+        "celui-la", "cet endroit", "ce prestataire",
+        "cette entreprise", "la-bas", "ce garage"
     ]
     if any(v in t for v in VAGUE):
         return svcs[0]
 
     for s in svcs:
         for fname in [
-            (s.get("name") or "").lower(),
-            (s.get("entreprise", {}).get("name") or "").lower()
+            normalize_text(s.get("name") or ""),
+            normalize_text((s.get("entreprise") or {}).get("name") or "")
         ]:
             for word in fname.split():
                 if len(word) >= 4 and word in t:
                     return s
 
-    FKWS = ["numéro", "contact", "appeler", "adresse", "prix", "horaire", "itinéraire"]
+    FKWS = ["numero", "contact", "appeler", "adresse", "prix", "horaire", "itineraire"]
     if len(text.split()) <= 6 and any(f in t for f in FKWS):
         return svcs[0]
 
@@ -621,9 +717,9 @@ def resolve_ref(text: str, ctx: Dict) -> Optional[Dict]:
 
 
 def resolve_all(text: str, ctx: Dict) -> List[Dict]:
-    t     = text.lower()
+    t     = normalize_text(text)
     MULTI = [
-        "tous", "toutes", "chacun", "leurs numéros", "leurs contacts",
+        "tous", "toutes", "chacun", "leurs numeros", "leurs contacts",
         "leurs adresses", "les prestataires", "tous les"
     ]
     if any(m in t for m in MULTI):
@@ -669,7 +765,7 @@ async def mem_save(cid: str, data: Dict):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def geocode(location: str) -> Optional[Tuple[float, float]]:
-    key = location.lower().strip()
+    key = normalize_text(location)
     if key in _GEO:
         return _GEO[key]
 
@@ -702,7 +798,7 @@ async def geocode(location: str) -> Optional[Tuple[float, float]]:
                         "q": f"{location}, Bénin",
                         "format": "json", "limit": 1, "countrycodes": "bj"
                     },
-                    headers={"User-Agent": "CarEasy-CarAI/9.0"},
+                    headers={"User-Agent": "CarEasy-CarAI/9.1"},
                 )
                 if r.status_code == 200 and r.json():
                     d = r.json()[0]
@@ -768,7 +864,6 @@ async def api_nearby(
     radius: float = 20,
     limit: int = 10
 ) -> List[Dict]:
-    """Interroge la BDD Laravel par GPS. Toujours appelé si coordonnées disponibles."""
     try:
         p: Dict[str, Any] = {"lat": lat, "lng": lng, "radius": radius, "limit": limit}
         if domaine:
@@ -778,10 +873,9 @@ async def api_nearby(
             if r.status_code == 200:
                 data = r.json().get("data", [])
                 _LEARN["stats"]["db_hits"] += 1
-                print(f"[DB] api_nearby({lat:.2f},{lng:.2f},{domaine}) -> {len(data)} resultats")
-                # BUG FIX #2 : normaliser le champ domaine (peut etre un dict ou une string)
+                print(f"[DB] api_nearby({lat:.2f},{lng:.2f},{domaine}) -> {len(data)} résultats")
                 normalized = [_normalize_service(s) for s in data]
-                return sorted(normalized, key=lambda x: x.get("distance_km", 999))
+                return sorted(normalized, key=lambda x: x.get("distance_km") or 999)
     except Exception as e:
         print(f"[DB] api_nearby ERREUR: {e}")
     _LEARN["stats"]["db_misses"] += 1
@@ -790,43 +884,49 @@ async def api_nearby(
 
 def _normalize_service(s: Dict) -> Dict:
     """
-    BUG FIX #1 : Normalise un service venant de /ai/services
-    pour qu il ait le meme format que /ai/services/nearby.
-    /ai/services retourne entreprise avec : id, name, logo, call_phone,
-    whatsapp_phone, email, address, status
-    /ai/services/nearby retourne entreprise avec : id, name, latitude,
-    longitude, google_formatted_address, call_phone, whatsapp_phone,
-    status_online, logo
+    FIX #5 : Normalise un service quel que soit son format d'origine
+    (/ai/services ou /ai/services/nearby) et normalise le domaine.
     """
     e = s.get("entreprise", {}) or {}
-    if isinstance(e, dict) and e.get("latitude") is not None:
-        # Deja au bon format (vient de nearby), juste normaliser domaine
-        s_copy = dict(s)
-        dom = s.get("domaine")
-        if isinstance(dom, dict):
-            s_copy["domaine"] = dom.get("name")
-        return s_copy
-    # Format venant de /ai/services - normaliser
+
+    # Normaliser le domaine (peut être dict ou string)
+    dom = s.get("domaine")
+    if isinstance(dom, dict):
+        dom = dom.get("name")
+
     s_copy = dict(s)
+    s_copy["domaine"] = dom
+
+    # Si l'entreprise a déjà latitude → format nearby, juste corriger l'adresse
+    if isinstance(e, dict) and e.get("latitude") is not None:
+        e_copy = dict(e)
+        # S'assurer que google_formatted_address est accessible comme "address"
+        if not e_copy.get("address"):
+            e_copy["address"] = e_copy.get("google_formatted_address")
+        s_copy["entreprise"] = e_copy
+        return s_copy
+
+    # Format /ai/services — reconstruire l'objet entreprise
     s_copy["entreprise"] = {
         "id":                       e.get("id"),
         "name":                     e.get("name"),
         "latitude":                 e.get("latitude"),
         "longitude":                e.get("longitude"),
         "google_formatted_address": e.get("google_formatted_address") or e.get("address"),
+        "address":                  e.get("google_formatted_address") or e.get("address"),
         "call_phone":               e.get("call_phone"),
         "whatsapp_phone":           e.get("whatsapp_phone"),
         "status_online":            e.get("status_online", True),
         "logo":                     e.get("logo"),
     }
-    dom = s.get("domaine")
-    if isinstance(dom, dict):
-        s_copy["domaine"] = dom.get("name")
     return s_copy
 
 
 async def api_by_domaine(domaine: str, limit: int = 15) -> List[Dict]:
-    """Interroge la BDD Laravel par domaine (sans GPS). BUG FIX #1 applique."""
+    """
+    FIX #5 : Envoie le domaine tel quel à Laravel qui filtre par LIKE.
+    Essaie aussi avec le nom normalisé si aucun résultat.
+    """
     try:
         async with httpx.AsyncClient(timeout=15) as c:
             r = await c.get(
@@ -836,8 +936,7 @@ async def api_by_domaine(domaine: str, limit: int = 15) -> List[Dict]:
             if r.status_code == 200:
                 data = r.json().get("data", [])
                 _LEARN["stats"]["db_hits"] += 1
-                print(f"[DB] api_by_domaine({domaine}) -> {len(data)} resultats")
-                # Normaliser le format pour qu il soit compatible avec clean_svc()
+                print(f"[DB] api_by_domaine({domaine!r}) -> {len(data)} résultats")
                 return [_normalize_service(s) for s in data]
     except Exception as e:
         print(f"[DB] api_by_domaine ERREUR: {e}")
@@ -846,11 +945,7 @@ async def api_by_domaine(domaine: str, limit: int = 15) -> List[Dict]:
 
 
 async def api_services_all(domaine: Optional[str] = None, limit: int = 20) -> List[Dict]:
-    """
-    BUG FIX #4 : Fallback ultime — recupere tous les services valides
-    sans filtrage GPS, avec un rayon elargi.
-    Utilise quand api_nearby ET api_by_domaine retournent 0 resultats.
-    """
+    """Fallback ultime — tous les services sans filtre GPS."""
     try:
         params: Dict[str, Any] = {"limit": limit}
         if domaine:
@@ -859,7 +954,7 @@ async def api_services_all(domaine: Optional[str] = None, limit: int = 20) -> Li
             r = await c.get(f"{LARAVEL_BASE}/ai/services", params=params)
             if r.status_code == 200:
                 data = r.json().get("data", [])
-                print(f"[DB] api_services_all({domaine}) -> {len(data)} resultats")
+                print(f"[DB] api_services_all({domaine!r}) -> {len(data)} résultats")
                 return [_normalize_service(s) for s in data]
     except Exception as e:
         print(f"[DB] api_services_all ERREUR: {e}")
@@ -878,21 +973,26 @@ async def api_domaines() -> List[str]:
 
 
 def clean_svc(s: Dict) -> Dict:
-    """
-    BUG FIX #6 : Securise clean_svc pour gerer les deux formats
-    (venant de /nearby et de /services) apres normalisation.
-    """
+    """FIX #5 : Sécurise tous les champs, gère les deux formats."""
     e = s.get("entreprise") or {}
-    # Securiser distance_km (peut etre None, string ou float)
+
     dist = s.get("distance_km")
     try:
         dist = round(float(dist), 1) if dist is not None else None
     except (TypeError, ValueError):
         dist = None
-    # Securiser le champ domaine (peut etre un dict ou une string)
+
     domaine_val = s.get("domaine")
     if isinstance(domaine_val, dict):
         domaine_val = domaine_val.get("name")
+
+    # FIX #5 : lire l'adresse depuis google_formatted_address OU address
+    address = (
+        e.get("google_formatted_address")
+        or e.get("address")
+        or None
+    )
+
     return {
         "id":                  s.get("id"),
         "name":                s.get("name"),
@@ -910,8 +1010,7 @@ def clean_svc(s: Dict) -> Dict:
         "entreprise": {
             "id":             e.get("id"),
             "name":           e.get("name"),
-            # BUG FIX : lire address depuis google_formatted_address ou address
-            "address":        e.get("google_formatted_address") or e.get("address"),
+            "address":        address,
             "latitude":       e.get("latitude"),
             "longitude":      e.get("longitude"),
             "call_phone":     e.get("call_phone"),
@@ -926,10 +1025,13 @@ def fmt_price(s: Dict) -> str:
     if s.get("is_price_on_request"):
         return "sur devis"
     p, pp = s.get("price"), s.get("price_promo")
-    if pp and s.get("has_promo") and p:
-        return f"{int(pp):,} FCFA (promotion — au lieu de {int(p):,} FCFA)".replace(",", " ")
-    if p:
-        return f"{int(p):,} FCFA".replace(",", " ")
+    try:
+        if pp and s.get("has_promo") and p:
+            return f"{int(float(pp)):,} FCFA (promo — au lieu de {int(float(p)):,} FCFA)".replace(",", " ")
+        if p:
+            return f"{int(float(p)):,} FCFA".replace(",", " ")
+    except (TypeError, ValueError):
+        pass
     return "prix non renseigné"
 
 
@@ -949,7 +1051,7 @@ def fmt_rating(s: Dict) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  PROMPT SYSTÈME OLLAMA v9
+#  PROMPT SYSTÈME OLLAMA v9.1
 # ═══════════════════════════════════════════════════════════════════════════════
 
 SYS = """Tu es CarAI, l'assistant intelligent de CarEasy Bénin.
@@ -969,15 +1071,16 @@ STYLE :
 - JAMAIS d'emojis — l'application mobile les gère elle-même.
 
 REGLES ABSOLUES :
-1. Si la base de données contient des prestataires -> liste-les avec leurs contacts réels.
+1. Si la base de données contient des prestataires -> liste-les TOUS avec leurs contacts réels (téléphone, WhatsApp, adresse).
 2. Si aucun prestataire -> explique clairement et propose des alternatives.
 3. Ne réponds qu'aux sujets automobiles et CarEasy.
 4. Pour les questions de suivi, utilise les prestataires déjà présentés.
+5. Ne dis JAMAIS "je n'ai pas accès" ou "je ne peux pas voir" si des données sont fournies ci-dessous.
 
 CONTEXTE CONVERSATION :
 {ctx}
 
-DONNEES BASE DE DONNEES CAREASY (temps réel) :
+DONNEES BASE DE DONNEES CAREASY (temps réel — utilise ces données) :
 {db}
 
 INFORMATIONS PLATEFORME :
@@ -990,22 +1093,23 @@ def build_db_block(
     all_svcs: List[Dict]
 ) -> str:
     if ref_svc:
-        e    = ref_svc.get("entreprise", {})
+        e    = ref_svc.get("entreprise", {}) or {}
         note = fmt_rating(ref_svc)
+        addr = e.get("google_formatted_address") or e.get("address") or "non renseignée"
         return (
             f"Prestataire : {e.get('name', ref_svc.get('name', 'Inconnu'))}\n"
             f"Service : {ref_svc.get('name', 'N/A')}\n"
             f"Prix : {fmt_price(ref_svc)} | Horaires : {fmt_hours(ref_svc)}\n"
             f"Telephone : {e.get('call_phone') or 'non renseigne'}\n"
             f"WhatsApp : {e.get('whatsapp_phone') or 'non renseigne'}\n"
-            f"Adresse : {e.get('address') or 'non renseignee'}"
+            f"Adresse : {addr}"
             + (f"\n{note}" if note else "")
         )
 
     if all_svcs:
-        lines = [f"{len(all_svcs)} prestataire(s) en memoire :"]
+        lines = [f"{len(all_svcs)} prestataire(s) en mémoire :"]
         for i, s in enumerate(all_svcs, 1):
-            e = s.get("entreprise", {})
+            e = s.get("entreprise", {}) or {}
             lines.append(
                 f"{i}. {e.get('name', 'Inconnu')} "
                 f"| Tel: {e.get('call_phone') or '—'} "
@@ -1014,20 +1118,21 @@ def build_db_block(
         return "\n".join(lines)
 
     if not services:
-        return "AUCUN prestataire trouve dans la base de donnees CarEasy pour cette recherche."
+        return "AUCUN prestataire trouvé dans la base de données CarEasy pour cette recherche."
 
-    lines = [f"{len(services)} prestataire(s) trouve(s) dans la base de donnees CarEasy :"]
+    lines = [f"{len(services)} prestataire(s) trouvé(s) dans la base de données CarEasy :"]
     for i, s in enumerate(services, 1):
-        e    = s.get("entreprise", {})
+        e    = s.get("entreprise", {}) or {}
         dist = s.get("distance_km")
         dst  = f" | {dist:.1f} km" if dist is not None else ""
         note = fmt_rating(s)
+        addr = e.get("google_formatted_address") or e.get("address") or "adresse non renseignée"
         lines.append(
             f"{i}. {e.get('name', 'Inconnu')} — {s.get('name', 'N/A')}{dst}"
             + (f" | {note}" if note else "") + "\n"
             f"   Prix: {fmt_price(s)} | Horaires: {fmt_hours(s)}\n"
             f"   Tel: {e.get('call_phone') or '—'} | WA: {e.get('whatsapp_phone') or '—'}\n"
-            f"   Adresse: {e.get('address') or 'non renseignee'}"
+            f"   Adresse: {addr}"
         )
     return "\n".join(lines)
 
@@ -1035,19 +1140,19 @@ def build_db_block(
 def build_ctx_block(ctx: Dict, history: List[Dict]) -> str:
     parts = []
     if ctx.get("last_domaine"):
-        parts.append(f"Service recherche : {ctx['last_domaine']}")
+        parts.append(f"Service recherché : {ctx['last_domaine']}")
     if ctx.get("last_location"):
         parts.append(f"Localisation : {ctx['last_location']}")
     if ctx.get("last_services"):
         noms = [
-            s.get("entreprise", {}).get("name", s.get("name", "Inconnu"))
+            (s.get("entreprise") or {}).get("name") or s.get("name") or "Inconnu"
             for s in ctx["last_services"][:4]
         ]
-        parts.append(f"Prestataires deja presentes : {', '.join(noms)}")
+        parts.append(f"Prestataires déjà présentés : {', '.join(noms)}")
     for turn in history[-4:]:
         role = "Client" if turn.get("role") == "user" else "CarAI"
         parts.append(f"{role}: {turn.get('content', '')[:150]}")
-    return "\n".join(parts) if parts else "Debut de conversation"
+    return "\n".join(parts) if parts else "Début de conversation"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1070,13 +1175,13 @@ async def ask_ollama(
         site_url=SITE_URL,
         ctx=build_ctx_block(ctx, history),
         db=build_db_block(services, ref_svc, all_svcs),
-        faq=faq_hint or "Pas d'information specifique sur la plateforme.",
+        faq=faq_hint or "Pas d'information spécifique sur la plateforme.",
     )
 
     msgs = [{"role": "system", "content": system}]
-    for t in history[-4:]:
-        role    = t.get("role", "user")
-        content = t.get("content", "")
+    for turn in history[-4:]:
+        role    = turn.get("role", "user")
+        content = turn.get("content", "")
         if content and role in ("user", "assistant"):
             msgs.append({"role": role, "content": content[:250]})
     msgs.append({"role": "user", "content": user_msg})
@@ -1114,7 +1219,7 @@ async def ask_ollama(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  FALLBACK RÈGLES — Réponses humaines si Ollama indisponible
+#  FALLBACK RÈGLES
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def fallback(
@@ -1140,23 +1245,16 @@ def fallback(
         ])
 
     if intent == "remerciement":
-        return random.choice([
-            "Avec plaisir !",
-            "De rien, bonne route !",
-            "Je suis là pour ça !",
-        ])
+        return random.choice(["Avec plaisir !", "De rien, bonne route !", "Je suis là pour ça !"])
 
     if intent == "aurevoir":
-        return random.choice([
-            "A bientot ! Bonne route.",
-            "Au revoir !",
-        ])
+        return random.choice(["À bientôt ! Bonne route.", "Au revoir !"])
 
     if intent == "bot_info":
         return (
-            f"Je suis CarAI, l'assistant de CarEasy Benin. "
-            f"Je vous aide a trouver des prestataires automobiles partout au Benin "
-            f"et a utiliser la plateforme CarEasy. Site : {SITE_URL}"
+            f"Je suis CarAI, l'assistant de CarEasy Bénin. "
+            f"Je vous aide à trouver des prestataires automobiles partout au Bénin "
+            f"et à utiliser la plateforme CarEasy. Site : {SITE_URL}"
         )
 
     if intent == "perso":
@@ -1168,75 +1266,75 @@ def fallback(
             return ans.replace("{site}", SITE_URL)
         return (
             f"Pour cette question, consultez {SITE_URL} "
-            "ou ecrivez a support@careasy.bj. L'equipe repond en general dans la journee."
+            "ou écrivez à support@careasy.bj. L'équipe répond en général dans la journée."
         )
 
     # Suivi — tous les prestataires
     if all_svcs and "followup" in intent:
-        lines = ["Voici les contacts des prestataires listes :"]
+        lines = ["Voici les contacts des prestataires listés :"]
         for i, s in enumerate(all_svcs, 1):
-            e  = s.get("entreprise", {})
+            e  = s.get("entreprise", {}) or {}
             ph = e.get("call_phone") or "—"
             wa = e.get("whatsapp_phone") or "—"
-            lines.append(f"{i}. {e.get('name', 'Inconnu')} — Tel : {ph}  |  WA : {wa}")
+            lines.append(f"{i}. {e.get('name', 'Inconnu')} — Tél : {ph}  |  WA : {wa}")
         return "\n".join(lines)
 
     # Suivi — un prestataire précis
     if ref_svc and "followup" in intent:
-        e   = ref_svc.get("entreprise", {})
+        e   = ref_svc.get("entreprise", {}) or {}
         ent = e.get("name", "Ce prestataire")
         svc = ref_svc.get("name", "ce service")
+        addr = e.get("google_formatted_address") or e.get("address") or "adresse non renseignée"
 
         if "contact" in intent:
             ph = e.get("call_phone") or ""
             wa = e.get("whatsapp_phone") or ""
             if not ph and not wa:
-                return f"Aucun contact renseigne pour {ent} pour le moment."
+                return f"Aucun contact renseigné pour {ent} pour le moment."
             parts = []
-            if ph: parts.append(f"Tel : {ph}")
+            if ph: parts.append(f"Tél : {ph}")
             if wa: parts.append(f"WhatsApp : {wa}")
             return f"{ent} — {' | '.join(parts)}"
 
         if "adresse" in intent or "itineraire" in intent:
-            addr = e.get("address") or ""
             if ulat and ulng and e.get("latitude") and e.get("longitude"):
-                d   = haversine(ulat, ulng, float(e["latitude"]), float(e["longitude"]))
-                url = map_link(ulat, ulng, float(e["latitude"]), float(e["longitude"]))
-                return (
-                    f"{ent} — {addr or 'adresse non renseignee'}. "
-                    f"Distance : {d:.1f} km (environ {dur(d)}). "
-                    f"Itineraire : {url}"
-                )
-            return f"{ent} : {addr or 'adresse non renseignee'}"
+                try:
+                    d   = haversine(ulat, ulng, float(e["latitude"]), float(e["longitude"]))
+                    url = map_link(ulat, ulng, float(e["latitude"]), float(e["longitude"]))
+                    return (
+                        f"{ent} — {addr}. "
+                        f"Distance : {d:.1f} km (environ {dur(d)}). "
+                        f"Itinéraire : {url}"
+                    )
+                except Exception:
+                    pass
+            return f"{ent} : {addr}"
 
         if "prix" in intent:
-            return f"Le service {svc} chez {ent} est a {fmt_price(ref_svc)}."
+            return f"Le service {svc} chez {ent} est à {fmt_price(ref_svc)}."
 
         if "horaire" in intent:
             return f"{ent} est {fmt_hours(ref_svc)}."
 
         ph   = e.get("call_phone") or "—"
         wa   = e.get("whatsapp_phone") or "—"
-        addr = e.get("address") or "adresse non renseignee"
-        return f"{ent} ({svc})\nTel : {ph}  |  WhatsApp : {wa}\nAdresse : {addr}"
+        return f"{ent} ({svc})\nTél : {ph}  |  WhatsApp : {wa}\nAdresse : {addr}"
 
     # Résultats de recherche
-    lieu = f"a {location}" if location else ("pres de vous" if ulat else "au Benin")
+    lieu = f"à {location}" if location else ("près de vous" if ulat else "au Bénin")
 
     if not services:
-        conseils = ""
-        if location:
-            conseils = " Vous pouvez aussi essayer une ville voisine ou elargir le rayon."
+        conseils = " Vous pouvez aussi essayer une ville voisine ou élargir le rayon." if location else ""
         return (
-            f"Je n'ai trouve aucun prestataire en "
+            f"Je n'ai trouvé aucun prestataire en "
             f"{domaine or 'ce domaine'} {lieu} pour le moment.{conseils} "
             f"De nouveaux prestataires rejoignent CarEasy chaque semaine. "
-            f"Vous etes prestataire ? Inscrivez-vous sur {SITE_URL}"
+            f"Vous êtes prestataire ? Inscrivez-vous sur {SITE_URL}"
         )
 
-    lines = [f"J'ai trouve {len(services)} prestataire(s) en {domaine or 'automobile'} {lieu} :"]
+    lines = [f"J'ai trouvé {len(services)} prestataire(s) en {domaine or 'automobile'} {lieu} :"]
     for i, s in enumerate(services[:5], 1):
-        e    = s.get("entreprise", {})
+        e    = s.get("entreprise", {}) or {}
         dist = s.get("distance_km")
         dst  = f" ({dist:.1f} km)" if dist is not None else ""
         note = fmt_rating(s)
@@ -1244,38 +1342,34 @@ def fallback(
             f"\n{i}. {e.get('name', 'Inconnu')}{dst}"
             + (f" — {note}" if note else "") + "\n"
             f"   {s.get('name', '')} | {fmt_hours(s)} | {fmt_price(s)}\n"
-            f"   Tel : {e.get('call_phone') or '—'}   WA : {e.get('whatsapp_phone') or '—'}"
+            f"   Tél : {e.get('call_phone') or '—'}   WA : {e.get('whatsapp_phone') or '—'}"
         )
     if len(services) > 5:
         lines.append(f"\n...et {len(services) - 5} autre(s) disponible(s).")
-    lines.append("\nVoulez-vous l'itineraire ou les contacts d'un prestataire en particulier ?")
+    lines.append("\nVoulez-vous l'itinéraire ou les contacts d'un prestataire en particulier ?")
     return "\n".join(lines)
 
 
 SUGG_BASE = [
-    "Trouver un garage mecanique",
+    "Trouver un garage mécanique",
     "Vulcanisateur disponible",
     "Lavage auto",
-    "Electricien auto",
-    "Depannage routier",
+    "Électricien auto",
+    "Dépannage routier",
 ]
 
 
-def suggestions(
-    domaine:  Optional[str],
-    location: Optional[str],
-    ctx:      Dict
-) -> List[str]:
+def suggestions(domaine: Optional[str], location: Optional[str], ctx: Dict) -> List[str]:
     result = []
     if ctx.get("last_services"):
-        result += ["Contacts de tous", "Itineraire vers le plus proche"]
+        result += ["Contacts de tous", "Itinéraire vers le plus proche"]
     if domaine and location:
-        result.append(f"{domaine} a {location}")
+        result.append(f"{domaine} à {location}")
     elif domaine:
-        result.append(f"{domaine} a Cotonou")
-        result.append(f"{domaine} a Abomey")
+        result.append(f"{domaine} à Cotonou")
+        result.append(f"{domaine} à Abomey-Calavi")
     if location:
-        result.append(f"Tous les services a {location}")
+        result.append(f"Tous les services à {location}")
     result += SUGG_BASE
     seen, final = set(), []
     for s in result:
@@ -1285,15 +1379,10 @@ def suggestions(
     return final[:5]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ENDPOINT PRINCIPAL /chat
-# ═══════════════════════════════════════════════════════════════════════════════
-
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, bg: BackgroundTasks):
     t0 = time.time()
 
-    # ── 1. Récupération mémoire ────────────────────────────────────────────
     mem     = await mem_get(req.conversation_id)
     ctx     = mem["ctx"]
     history = mem["history"]
@@ -1305,13 +1394,12 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
     radius   = extract_radius(req.message)
     wc       = len(req.message.split())
 
-    # ── 2. Enrichissement contextuel ──────────────────────────────────────
     FOLLOW_INTENTS = {
         "followup_contact", "followup_adresse", "followup_prix",
         "followup_horaires", "followup_itineraire", "followup_info", "urgence",
     }
 
-    # Hériter du domaine du contexte si pas détecté dans le message
+    # Hériter du domaine du contexte si pas détecté
     if not domaine and ctx.get("last_domaine") and (
         intent in FOLLOW_INTENTS
         or ctx.get("last_services")
@@ -1325,12 +1413,10 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
     }:
         location = ctx.get("last_location")
 
-    # ── 3. Résolution de références conversationnelles ─────────────────────
     ref_svc    = resolve_ref(req.message, ctx)
     all_svcs   = resolve_all(req.message, ctx)
     is_followup = bool(ref_svc or all_svcs) and intent in FOLLOW_INTENTS
 
-    # ── 4. REQUÊTE BASE DE DONNÉES (logique centralisée) ──────────────────
     services:  List[Dict] = []
     mapurl:    Optional[str] = None
     itinerary: Optional[Dict] = None
@@ -1338,34 +1424,25 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
     should_query_db = _needs_db(intent, domaine, location, ctx, wc)
 
     if should_query_db and not is_followup:
-        # ── CAS 1 : GPS disponible dans la requete courante ──────────────────
+
+        # CAS 1 : GPS en temps réel
         if req.latitude and req.longitude:
-            services = await api_nearby(
-                req.latitude, req.longitude, domaine, radius, limit=10
-            )
-            # BUG FIX #5a : si nearby retourne rien avec GPS, elargir le rayon
+            services = await api_nearby(req.latitude, req.longitude, domaine, radius, limit=10)
             if not services:
-                services = await api_nearby(
-                    req.latitude, req.longitude, domaine, 50, limit=10
-                )
-            # BUG FIX #5b : si toujours rien, fallback par domaine sans GPS
+                services = await api_nearby(req.latitude, req.longitude, domaine, 50, limit=10)
             if not services and domaine:
                 services = await api_by_domaine(domaine, limit=15)
             if not services:
                 services = await api_services_all(domaine, limit=15)
-            # Calculer l itineraire vers le premier resultat si GPS
+            # Calcul itinéraire vers le 1er résultat
             if services:
-                e0 = services[0].get("entreprise", {}) or {}
+                e0 = (services[0].get("entreprise") or {})
                 if e0.get("latitude") and e0.get("longitude"):
                     try:
-                        d_km = haversine(
-                            req.latitude, req.longitude,
-                            float(e0["latitude"]), float(e0["longitude"])
-                        )
-                        mapurl    = map_link(
-                            req.latitude, req.longitude,
-                            float(e0["latitude"]), float(e0["longitude"])
-                        )
+                        d_km  = haversine(req.latitude, req.longitude,
+                                          float(e0["latitude"]), float(e0["longitude"]))
+                        mapurl = map_link(req.latitude, req.longitude,
+                                          float(e0["latitude"]), float(e0["longitude"]))
                         itinerary = {
                             "maps_url":    mapurl,
                             "distance":    f"{d_km:.1f} km",
@@ -1375,62 +1452,50 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
                     except Exception:
                         pass
 
-        # ── CAS 2 : GPS memorise dans le contexte ────────────────────────────
+        # CAS 2 : GPS mémorisé en contexte
         elif ctx.get("last_lat") and ctx.get("last_lng") and not location:
-            services = await api_nearby(
-                float(ctx["last_lat"]), float(ctx["last_lng"]),
-                domaine, radius, limit=10
-            )
-            # BUG FIX #5c : fallback si rien
+            services = await api_nearby(float(ctx["last_lat"]), float(ctx["last_lng"]),
+                                        domaine, radius, limit=10)
             if not services and domaine:
                 services = await api_by_domaine(domaine, limit=15)
             if not services:
                 services = await api_services_all(domaine, limit=15)
 
-        # ── CAS 3 : Ville mentionnee → geocodage puis recherche ──────────────
+        # CAS 3 : Ville mentionnée → géocodage
         elif location:
             coords = await geocode(location)
             if coords:
-                services = await api_nearby(
-                    coords[0], coords[1], domaine, radius, limit=10
-                )
-                # Elargir automatiquement si aucun resultat
+                services = await api_nearby(coords[0], coords[1], domaine, radius, limit=10)
                 if not services:
-                    services = await api_nearby(
-                        coords[0], coords[1], domaine, radius * 3, limit=10
-                    )
-            # BUG FIX #5d : Fallback par domaine si toujours rien
+                    services = await api_nearby(coords[0], coords[1], domaine, radius * 3, limit=10)
             if not services and domaine:
                 services = await api_by_domaine(domaine, limit=15)
-            # BUG FIX #5e : Dernier recours - tous les services
             if not services:
                 services = await api_services_all(domaine, limit=15)
 
-        # ── CAS 4 : Seulement un domaine detecte → recherche nationale ───────
+        # CAS 4 : Domaine détecté, pas de GPS ni ville
         elif domaine:
             services = await api_by_domaine(domaine, limit=15)
-            # BUG FIX #5f : si api_by_domaine retourne rien, essayer api_services_all
             if not services:
                 services = await api_services_all(domaine, limit=15)
-                print(f"[DB] Fallback api_services_all pour domaine={domaine} -> {len(services)}")
 
-        # ── CAS 5 (NOUVEAU) : Aucun critere mais contexte domaine present ────
-        # BUG FIX #5g : Si l utilisateur pose une question generique avec un
-        # contexte domaine memorise, on re-interroge la BDD
+        # CAS 5 : Aucun critère mais contexte domaine mémorisé
         elif ctx.get("last_domaine") and intent not in {"faq", "general"}:
             services = await api_by_domaine(ctx["last_domaine"], limit=10)
 
+        # FIX #4 : CAS 6 — message général sufisamment long sans critère détecté
+        # Ex: "tu as quoi comme services ?" → retourner tous les services
+        elif intent == "general" and wc >= 4:
+            services = await api_services_all(limit=10)
+
     _track_query(domaine, location, len(services))
 
-    # Services actifs pour Ollama (résultats frais ou résultats mémorisés pour followup)
     active = services or (ctx.get("last_services", []) if is_followup else [])
 
-    # ── 5. Hint FAQ pour Ollama ────────────────────────────────────────────
     faq_hint = None
     if intent in {"faq", "general", "bot_info"}:
         faq_hint = faq_lookup(req.message)
 
-    # ── 6. Génération de réponse via Ollama ───────────────────────────────
     reply = await ask_ollama(
         user_msg=req.message,
         ctx=ctx,
@@ -1441,7 +1506,6 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
         faq_hint=faq_hint,
     )
 
-    # ── 7. Fallback si Ollama indisponible ────────────────────────────────
     if not reply:
         reply = fallback(
             intent=intent,
@@ -1457,11 +1521,9 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
             ulng=req.longitude,
         )
 
-    # ── 8. Nettoyage final ────────────────────────────────────────────────
     reply = re.sub(r"http://localhost[^\s]*", SITE_URL, reply)
     reply = re.sub(r"localhost:\d+", SITE_URL, reply)
 
-    # ── 9. Sauvegarde mémoire ─────────────────────────────────────────────
     cleaned = [clean_svc(s) for s in services[:8]]
 
     history.append({
@@ -1489,15 +1551,13 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
     print(
         f"[CHAT] {req.conversation_id[:12]} | intent={intent} | "
         f"domaine={domaine or '-'} | loc={location or '-'} | "
-        f"services={len(active)} | db={'requete' if should_query_db else 'skip'} | "
-        f"{elapsed:.2f}s | hits={_LEARN['stats']['db_hits']}"
+        f"services={len(active)} | db={'oui' if should_query_db else 'non'} | "
+        f"{elapsed:.2f}s"
     )
 
     return ChatResponse(
         reply=reply,
-        services=cleaned if cleaned else (
-            ctx.get("last_services", [])[:3] if is_followup else []
-        ),
+        services=cleaned if cleaned else (ctx.get("last_services", [])[:3] if is_followup else []),
         map_url=mapurl,
         itinerary=itinerary,
         intent=domaine or intent,
@@ -1505,11 +1565,6 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
         suggestions=suggestions(domaine, location, ctx),
         confidence=_confidence(req.message, intent),
     )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  FEEDBACK
-# ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/feedback")
 async def feedback_endpoint(req: FeedbackRequest, bg: BackgroundTasks):
@@ -1528,16 +1583,9 @@ async def feedback_endpoint(req: FeedbackRequest, bg: BackgroundTasks):
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ENDPOINTS UTILITAIRES
-# ═══════════════════════════════════════════════════════════════════════════════
-
 @app.get("/health")
 async def health():
-    redis_ok  = False
-    ollama_ok = False
-    model_ok  = False
-    db_ok     = False
+    redis_ok = ollama_ok = model_ok = db_ok = False
 
     if redis_client:
         try:
@@ -1552,10 +1600,7 @@ async def health():
                 r = await c.get(f"{OLLAMA_URL}/api/tags")
                 if r.status_code == 200:
                     ollama_ok = True
-                    model_ok  = any(
-                        OLLAMA_MODEL in m["name"]
-                        for m in r.json().get("models", [])
-                    )
+                    model_ok  = any(OLLAMA_MODEL in m["name"] for m in r.json().get("models", []))
         except Exception:
             pass
 
@@ -1568,7 +1613,7 @@ async def health():
 
     return {
         "status":      "ok",
-        "version":     "9.0.0",
+        "version":     "9.1.0",
         "mode":        "ollama+rules+db" if ollama_ok else "rules+db",
         "redis":       redis_ok,
         "ollama":      ollama_ok,
@@ -1653,53 +1698,70 @@ async def reset_bad():
 async def test_ep():
     results: Dict[str, str] = {}
 
-    # Test 1 : Laravel domaines
     try:
         async with httpx.AsyncClient(timeout=6) as c:
             r = await c.get(f"{LARAVEL_BASE}/ai/domaines")
             n = len(r.json().get("data", [])) if r.status_code == 200 else 0
-            results["laravel_domaines"] = (
-                f"OK — {n} domaines" if r.status_code == 200
-                else f"ERREUR HTTP {r.status_code}"
-            )
+            results["laravel_domaines"] = f"OK — {n} domaines" if r.status_code == 200 else f"ERREUR HTTP {r.status_code}"
     except Exception as e:
         results["laravel_domaines"] = f"ERREUR: {e}"
 
-    # Test 2 : Services proches de Cotonou
     try:
-        svcs = await api_nearby(6.3654, 2.4183, None, 20, 3)
+        svcs = await api_nearby(6.3654, 2.4183, None, 50, 5)
         results["laravel_nearby_cotonou"] = f"OK — {len(svcs)} services"
     except Exception as e:
         results["laravel_nearby_cotonou"] = f"ERREUR: {e}"
 
-    # Test 3 : Services par domaine
     try:
-        svcs = await api_by_domaine("Garage mecanique", limit=3)
-        results["laravel_by_domaine"] = f"OK — {len(svcs)} services"
+        svcs = await api_by_domaine("Station d'essence", limit=3)
+        results["laravel_by_domaine_essence"] = f"OK — {len(svcs)} services"
     except Exception as e:
-        results["laravel_by_domaine"] = f"ERREUR: {e}"
+        results["laravel_by_domaine_essence"] = f"ERREUR: {e}"
 
-    # Test 4 : Géocodage
     try:
-        coords = await geocode("Abomey")
-        results["geocode_abomey"] = f"OK — {coords}" if coords else "Aucun résultat"
+        svcs = await api_services_all(limit=5)
+        results["laravel_services_all"] = f"OK — {len(svcs)} services"
     except Exception as e:
-        results["geocode_abomey"] = f"ERREUR: {e}"
+        results["laravel_services_all"] = f"ERREUR: {e}"
 
-    # Test 5 : Ollama
+    try:
+        dom = extract_domaine("je cherche de l'essence")
+        results["extract_domaine_essence"] = f"OK — '{dom}'" if dom else "ECHEC — None retourné"
+    except Exception as e:
+        results["extract_domaine_essence"] = f"ERREUR: {e}"
+
+    try:
+        dom = extract_domaine("je cherche de l\u2019essence")
+        results["extract_domaine_essence_unicode"] = f"OK — '{dom}'" if dom else "ECHEC — None retourné"
+    except Exception as e:
+        results["extract_domaine_essence_unicode"] = f"ERREUR: {e}"
+
+    try:
+        dom = extract_domaine("garage mecanique pres de moi")
+        results["extract_domaine_garage"] = f"OK — '{dom}'" if dom else "ECHEC — None retourné"
+    except Exception as e:
+        results["extract_domaine_garage"] = f"ERREUR: {e}"
+
+    try:
+        coords = await geocode("Abomey-Calavi")
+        results["geocode_abomey_calavi"] = f"OK — {coords}" if coords else "Aucun résultat"
+    except Exception as e:
+        results["geocode_abomey_calavi"] = f"ERREUR: {e}"
+
     if USE_OLLAMA:
         try:
             async with httpx.AsyncClient(timeout=6) as c:
                 r = await c.get(f"{OLLAMA_URL}/api/tags")
                 models = [m["name"] for m in r.json().get("models", [])] if r.status_code == 200 else []
-                results["ollama"] = f"OK — modeles: {models}"
+                results["ollama"] = f"OK — modèles: {models}"
         except Exception as e:
-            results["ollama"] = f"ERREUR: {e}"
+            results["ollama"] = f"ERREUR (non bloquant): {e}"
     else:
-        results["ollama"] = "Desactive"
+        results["ollama"] = "Désactivé — mode fallback actif"
 
-    results["redis"]    = "Connecte" if redis_client else "RAM actif"
-    results["site_url"] = SITE_URL
-    results["version"]  = "9.0.0"
+    results["redis"]        = "Connecté" if redis_client else "RAM actif (non bloquant)"
+    results["site_url"]     = SITE_URL
+    results["version"]      = "9.1.0"
+    results["kw2dom_count"] = str(len(KW2DOM))
 
-    return {"version": "9.0.0", "tests": results}
+    return {"version": "9.1.0", "tests": results}
