@@ -21,7 +21,7 @@ USE_OLLAMA      = os.getenv("USE_OLLAMA",       "true").lower() == "true"
 SITE_URL        = os.getenv("FRONTEND_URL",     "https://careasy.vercel.app")
 LEARN_FILE      = os.getenv("LEARN_FILE",       "/tmp/carai_learn_v9.json")
 
-app = FastAPI(title="CarAI v9.1", version="9.1.0", docs_url="/docs")
+app = FastAPI(title="CarAI v9.2", version="9.2.0", docs_url="/docs")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
@@ -48,23 +48,13 @@ _LEARN: Dict[str, Any] = {
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  UTILITAIRE — Normalisation texte
-#  FIX #1 : apostrophes Unicode (\u2019 etc.) → ASCII, accents conservés
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def normalize_text(text: str) -> str:
-    """
-    Normalise un texte pour la comparaison :
-    - Apostrophes typographiques → apostrophe ASCII '
-    - Tirets spéciaux → tiret ASCII -
-    - Minuscules
-    - NFC unicode (évite les doubles encodages)
-    """
     text = unicodedata.normalize("NFC", text)
-    # Toutes les variantes d'apostrophe → '
     text = text.replace("\u2019", "'").replace("\u2018", "'") \
                .replace("\u02BC", "'").replace("\u0060", "'") \
                .replace("\u00B4", "'")
-    # Tirets longs → tiret court
     text = text.replace("\u2013", "-").replace("\u2014", "-")
     return text.lower()
 
@@ -131,9 +121,8 @@ async def startup():
         except Exception as e:
             print(f"[CarAI] Ollama KO ({e}) — mode fallback actif")
 
-    print(f"[CarAI] v9.1 | {LARAVEL_BASE} | Ollama={'ON' if USE_OLLAMA else 'OFF'}")
+    print(f"[CarAI] v9.2 | {LARAVEL_BASE} | Ollama={'ON' if USE_OLLAMA else 'OFF'}")
 
-    # Test connectivité Laravel
     try:
         async with httpx.AsyncClient(timeout=8) as c:
             r = await c.get(f"{LARAVEL_BASE}/ai/domaines")
@@ -145,7 +134,6 @@ async def startup():
     except Exception as e:
         print(f"[CarAI] ATTENTION: Laravel inaccessible au démarrage: {e}")
 
-    # Test services nearby
     try:
         async with httpx.AsyncClient(timeout=8) as c:
             r = await c.get(
@@ -162,7 +150,6 @@ async def startup():
     except Exception as e:
         print(f"[CarAI] ATTENTION: Test services/nearby échoué: {e}")
 
-    # Test services sans GPS (fallback)
     try:
         async with httpx.AsyncClient(timeout=8) as c:
             r = await c.get(f"{LARAVEL_BASE}/ai/services", params={"limit": 3})
@@ -192,8 +179,7 @@ def _load_learn():
             print(f"[Learn] {len(_LEARN['pattern_scores'])} patterns, "
                   f"{len(_LEARN['faq_corrections'])} corrections")
     except Exception as e:
-        print(f"[Learn] Chargement ignoré (fichier absent ou corrompu): {e}")
-        # FIX #2 : Ne pas crasher si le fichier est absent ou corrompu
+        print(f"[Learn] Chargement ignoré: {e}")
 
 
 def _save_learn():
@@ -201,7 +187,7 @@ def _save_learn():
         with open(LEARN_FILE, "w", encoding="utf-8") as f:
             json.dump(_LEARN, f, ensure_ascii=False, indent=2, default=str)
     except Exception as e:
-        print(f"[Learn] Sauvegarde échouée (non bloquant): {e}")
+        print(f"[Learn] Sauvegarde échouée: {e}")
 
 
 def _h(text: str) -> str:
@@ -260,7 +246,6 @@ def _confidence(message: str, intent: str) -> float:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  DOMAINES
-#  FIX #1 : Clés normalisées (apostrophes ASCII) + mots-clés enrichis
 # ═══════════════════════════════════════════════════════════════════════════════
 
 DOMAINES: Dict[str, List[str]] = {
@@ -293,7 +278,7 @@ DOMAINES: Dict[str, List[str]] = {
         "peinture voiture", "rayure carrosserie", "retouche peinture", "vernis voiture",
     ],
     "Tolerie": [
-        "tolerie", "tôlerie", "carrosserie", "bosselage", "debosselage", "dent voiture",
+        "tolerie", "tolerie", "carrosserie", "bosselage", "debosselage", "dent voiture",
     ],
     "Depannage / remorquage": [
         "depannage", "depanneur", "remorquage", "voiture en panne",
@@ -348,15 +333,11 @@ DOMAINES: Dict[str, List[str]] = {
     ],
 }
 
-# FIX #1 : Construire KW2DOM avec clés normalisées (apostrophes ASCII, minuscules)
 KW2DOM: Dict[str, str] = {}
 for dom, kws in DOMAINES.items():
-    dom_normalized = normalize_text(dom)
     for kw in kws:
         KW2DOM[normalize_text(kw)] = dom
 
-# FIX #1b : Ajouter aussi les noms de domaines eux-mêmes comme mots-clés
-# (ex: "station d'essence" tapé par l'utilisateur doit matcher)
 for dom in DOMAINES.keys():
     dom_n = normalize_text(dom)
     if dom_n not in KW2DOM:
@@ -382,7 +363,7 @@ STOP_LOC = {
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  FAQ
+#  FAQ — avec guidance navigation application mobile CarEasy
 # ═══════════════════════════════════════════════════════════════════════════════
 
 FAQ: List[Dict] = [
@@ -391,82 +372,199 @@ FAQ: List[Dict] = [
                  "rejoindre", "soumettre dossier", "enregistrer entreprise", "creer une entreprise",
                  "comment creer entreprise"],
         "content": (
-            "Pour inscrire votre entreprise sur CarEasy : "
-            "1) Créez un compte avec votre email ou téléphone. "
-            "2) Cliquez sur Devenir prestataire et remplissez le formulaire. "
-            "3) Téléchargez vos documents : IFU, RCCM et certificat d'immatriculation. "
-            "4) Soumettez votre dossier — validation sous 24 à 48 heures ouvrables. "
+            "Pour inscrire votre entreprise sur CarEasy :\n"
+            "1) Ouvrez l'application CarEasy et créez un compte.\n"
+            "2) Dans la barre de navigation, appuyez sur Entreprise puis Créer.\n"
+            "3) Remplissez le formulaire en 4 étapes : informations générales, documents légaux (IFU, RCCM, certificat), dirigeant et contacts, localisation.\n"
+            "4) Soumettez votre dossier — validation sous 24 à 48 heures ouvrables.\n"
             "5) Après validation : essai gratuit de 30 jours avec 3 services maximum."
         )
     },
     {
         "tags": ["documents requis", "ifu", "rccm", "certificat", "pieces dossier"],
-        "content": "Documents requis : IFU, RCCM, certificat d'immatriculation. Formats : PDF, JPG, PNG — max 5 Mo chacun."
+        "content": (
+            "Documents requis pour l'inscription de votre entreprise dans l'app CarEasy :\n"
+            "- IFU (Identifiant Fiscal Unique)\n"
+            "- RCCM (Registre du Commerce)\n"
+            "- Certificat d'immatriculation\n"
+            "Formats acceptés : PDF, JPG, PNG — max 5 Mo chacun."
+        )
     },
     {
         "tags": ["validation", "delai validation", "dossier en attente"],
-        "content": "La validation prend 24 à 48 heures ouvrables. Vous êtes notifié par email et SMS."
+        "content": (
+            "Après soumission dans l'application CarEasy, la validation prend 24 à 48 heures ouvrables. "
+            "Vous recevrez une notification dans l'app et par email dès que votre dossier est traité. "
+            "Vous pouvez suivre le statut dans l'onglet Mes entreprises."
+        )
     },
     {
         "tags": ["dossier rejete", "refus", "pourquoi rejete"],
-        "content": "En cas de refus, la raison est précisée dans la notification. Causes fréquentes : documents illisibles ou informations incomplètes. Vous pouvez corriger et soumettre à nouveau."
+        "content": (
+            "Si votre dossier est rejeté, la raison est visible dans l'onglet Mes entreprises de l'application. "
+            "Causes fréquentes : documents illisibles ou informations incomplètes. "
+            "Appuyez sur Resoumettre une demande, corrigez et renvoyez."
+        )
     },
     {
         "tags": ["mot de passe oublie", "reinitialiser", "forgot password", "reset"],
-        "content": "Pour réinitialiser votre mot de passe : cliquez Mot de passe oublié, entrez votre email ou téléphone, saisissez le code OTP à 6 chiffres valable 5 minutes, puis définissez votre nouveau mot de passe."
+        "content": (
+            "Pour réinitialiser votre mot de passe depuis l'application CarEasy :\n"
+            "1) Écran de connexion → Mot de passe oublié.\n"
+            "2) Entrez votre email ou numéro de téléphone.\n"
+            "3) Saisissez le code OTP à 6 chiffres reçu par SMS ou email (valable 5 minutes).\n"
+            "4) Définissez votre nouveau mot de passe."
+        )
     },
     {
         "tags": ["rendez-vous", "prendre rdv", "reserver", "booking"],
-        "content": "Pour prendre un rendez-vous : ouvrez la fiche d'un service, cliquez Prendre RDV, choisissez la date et le créneau, confirmez. Le prestataire confirme ensuite avec notification à chaque étape."
+        "content": (
+            "Pour prendre un rendez-vous dans l'application CarEasy :\n"
+            "1) Depuis l'accueil, sélectionnez un service.\n"
+            "2) Sur la fiche du service, appuyez sur Prendre rendez-vous.\n"
+            "3) Choisissez la date parmi les jours disponibles, puis le créneau horaire.\n"
+            "4) Ajoutez des notes si besoin et confirmez.\n"
+            "Le prestataire confirme ensuite — vous êtes notifié à chaque étape."
+        )
     },
     {
         "tags": ["annuler rdv", "annuler rendez-vous", "cancel rdv"],
-        "content": "Pour annuler un RDV : Mes rendez-vous, sélectionnez le RDV, Annuler, indiquez le motif. Possible uniquement si le statut est En attente ou Confirmé."
+        "content": (
+            "Pour annuler un rendez-vous dans l'app CarEasy :\n"
+            "1) Onglet Rendez-vous dans la navigation.\n"
+            "2) Sélectionnez le RDV concerné.\n"
+            "3) Appuyez sur Annuler et indiquez le motif.\n"
+            "Possible uniquement si le statut est En attente ou Confirmé."
+        )
     },
     {
         "tags": ["message", "contacter prestataire", "messagerie", "contacter"],
-        "content": "Pour contacter un prestataire : fiche du service, bouton Message ou WhatsApp. La messagerie interne supporte texte, images, vidéos, vocaux et localisation."
+        "content": (
+            "Pour contacter un prestataire via l'application CarEasy :\n"
+            "1) Ouvrez la fiche du service.\n"
+            "2) Appuyez sur Message pour la messagerie interne ou WhatsApp pour WhatsApp direct.\n"
+            "3) Vous pouvez aussi appeler directement via le bouton Appeler.\n"
+            "La messagerie supporte texte, images, vidéos, messages vocaux et localisation GPS."
+        )
     },
     {
         "tags": ["abonnement", "plans", "tarifs", "prix careasy", "offres prestataire"],
         "content": (
-            "Plans CarEasy prestataire : "
-            "Essentiel 25 000 FCFA par mois (5 services). "
-            "Professionnel 50 000 FCFA par mois (15 services, statistiques, support prioritaire). "
-            "Premium 100 000 FCFA par mois (illimité, SMS clients, API). "
-            "Annuel 1 000 000 FCFA par an (Premium + 2 mois offerts). "
-            "Essai gratuit 30 jours inclus à la validation."
+            "Plans CarEasy prestataire (section Plans & Abonnements dans Paramètres) :\n"
+            "- Essentiel : 25 000 FCFA/mois (5 services)\n"
+            "- Professionnel : 50 000 FCFA/mois (15 services, statistiques, support prioritaire)\n"
+            "- Premium : 100 000 FCFA/mois (illimité, SMS clients, API)\n"
+            "- Annuel : 1 000 000 FCFA/an (Premium + 2 mois offerts)\n"
+            "Essai gratuit 30 jours inclus automatiquement à la validation."
         )
     },
     {
         "tags": ["essai gratuit", "trial", "30 jours", "periode essai"],
-        "content": "L'essai gratuit de 30 jours se déclenche automatiquement à la validation. Il inclut 3 services, visibilité clients et gestion des RDV. Un plan payant est requis après les 30 jours."
+        "content": (
+            "L'essai gratuit de 30 jours démarre automatiquement après validation de votre entreprise. "
+            "Il inclut 3 services maximum, la visibilité clients et la gestion des rendez-vous. "
+            "Suivez le décompte dans l'onglet Mes entreprises → badge bleu Essai gratuit. "
+            "Un plan payant est requis après les 30 jours pour continuer."
+        )
     },
     {
         "tags": ["payer", "paiement", "fedapay", "mobile money", "orange money", "mtn"],
-        "content": "Paiement via FedaPay : Orange Money, MTN Money, Moov Money ou carte bancaire. Allez dans Abonnements, choisissez votre plan et payez. Une facture est envoyée par email."
+        "content": (
+            "Pour souscrire à un plan dans l'application CarEasy :\n"
+            "1) Allez dans Paramètres → Plans & Abonnements.\n"
+            "2) Choisissez votre plan et appuyez sur Souscrire.\n"
+            "3) Payez via FedaPay : Orange Money, MTN Money, Moov Money ou carte bancaire.\n"
+            "Une facture est envoyée par email après paiement."
+        )
     },
     {
         "tags": ["support", "aide", "probleme", "bug", "contacter careasy"],
-        "content": "Support CarEasy : support@careasy.bj ou via WhatsApp sur le site. Disponible du lundi au vendredi de 8h à 18h."
+        "content": (
+            "Support CarEasy :\n"
+            "- Dans l'application : Paramètres → Aide & support\n"
+            "- Email : support@careasy.bj\n"
+            "- WhatsApp : disponible depuis la page À propos de l'app\n"
+            "Disponible du lundi au vendredi de 8h à 18h."
+        )
     },
     {
         "tags": ["creer service", "ajouter service", "publier service"],
-        "content": "Pour créer un service : Espace prestataire, Mes services, Ajouter. Renseignez nom, domaine, prix ou sur devis, horaires et photos. Pendant l'essai : 3 services maximum."
+        "content": (
+            "Pour créer un service dans l'application CarEasy :\n"
+            "1) Onglet Entreprise → Mes entreprises → sélectionnez votre entreprise.\n"
+            "2) Appuyez sur Gérer puis Nouveau service.\n"
+            "3) Renseignez : nom, domaine, prix (ou Sur devis), horaires d'ouverture par jour, photos.\n"
+            "4) Confirmez — le service est immédiatement visible par les clients.\n"
+            "Note : pendant l'essai gratuit, 3 services maximum."
+        )
     },
     {
-        "tags": ["position gps", "geolocalisation", "localisation"],
-        "content": "Activez la géolocalisation pour voir les prestataires proches de vous. Ou mentionnez votre quartier ou votre ville directement dans le message."
+        "tags": ["position gps", "geolocalisation", "localisation", "activer gps"],
+        "content": (
+            "Pour activer la géolocalisation dans CarEasy :\n"
+            "L'application vous demande l'autorisation au premier lancement. "
+            "Si vous l'avez refusée, allez dans les Paramètres de votre téléphone → Applications → CarEasy → Autorisations → Localisation. "
+            "La géolocalisation affiche automatiquement les prestataires les plus proches de vous sur la carte."
+        )
     },
     {
         "tags": ["laisser avis", "noter", "evaluer", "review", "donner note"],
-        "content": "Après une prestation : Mes rendez-vous, onglet Terminés, Laisser un avis. Note de 1 à 5 étoiles avec commentaire optionnel."
+        "content": (
+            "Pour laisser un avis dans l'application CarEasy :\n"
+            "1) Onglet Rendez-vous → onglet Terminés.\n"
+            "2) Sélectionnez le RDV terminé.\n"
+            "3) Appuyez sur Noter ce service.\n"
+            "4) Donnez une note de 1 à 5 étoiles et un commentaire optionnel."
+        )
+    },
+    {
+        "tags": ["modifier profil", "changer photo", "modifier compte"],
+        "content": (
+            "Pour modifier votre profil dans CarEasy :\n"
+            "1) Onglet Profil (icône personne) dans la barre de navigation.\n"
+            "2) Appuyez sur Modifier le profil pour changer nom, email ou téléphone.\n"
+            "3) Pour la photo : icône appareil photo sur votre avatar → choisir Galerie ou Appareil photo.\n"
+            "4) Pour le mot de passe : Paramètres → Confidentialité & sécurité → Changer le mot de passe."
+        )
+    },
+    {
+        "tags": ["notifications", "alertes", "notification"],
+        "content": (
+            "Pour gérer les notifications dans CarEasy :\n"
+            "Paramètres → Notifications. "
+            "Vous pouvez activer/désactiver les notifications push, email et SMS, "
+            "et choisir le son de notification."
+        )
+    },
+    {
+        "tags": ["theme", "mode sombre", "apparence", "dark mode"],
+        "content": (
+            "Pour changer le thème de l'application CarEasy :\n"
+            "Paramètres → Apparence → choisissez Clair, Sombre ou Système (suit votre téléphone)."
+        )
+    },
+    {
+        "tags": ["connexion qr", "qr code connexion", "scanner qr", "autre telephone"],
+        "content": (
+            "Pour vous connecter sur un autre téléphone via QR code :\n"
+            "1) Sur l'appareil déjà connecté : Paramètres → Confidentialité & sécurité → Appareils connectés → Ajouter via QR.\n"
+            "2) Sur le nouvel appareil : écran de bienvenue → Connexion rapide via QR code.\n"
+            "3) Scannez le QR code — connexion automatique et sécurisée (valable 2 minutes)."
+        )
+    },
+    {
+        "tags": ["messages", "conversations", "tchat", "chat"],
+        "content": (
+            "Pour accéder à vos messages dans CarEasy :\n"
+            "Appuyez sur l'onglet Messages (icône bulle) dans la barre de navigation en bas. "
+            "Vous y trouvez toutes vos conversations avec les prestataires. "
+            "L'onglet affiche un badge rouge avec le nombre de messages non lus."
+        )
     },
 ]
 
 
 def faq_lookup(text: str) -> Optional[str]:
-    # FIX #1 : Normaliser le texte avant recherche
     t          = normalize_text(text)
     correction = _correction(text)
     if correction:
@@ -504,12 +602,7 @@ def detect_lang(text: str) -> str:
 
 
 def extract_domaine(text: str) -> Optional[str]:
-    """
-    FIX #1 : Normalise le texte avant extraction pour gérer toutes les
-    variantes d'apostrophes et de caractères spéciaux.
-    """
     t = normalize_text(text)
-    # Trier par longueur décroissante pour matcher les mots-clés les plus longs d'abord
     for kw in sorted(KW2DOM.keys(), key=len, reverse=True):
         if kw in t:
             return KW2DOM[kw]
@@ -517,9 +610,6 @@ def extract_domaine(text: str) -> Optional[str]:
 
 
 def extract_location(text: str) -> Optional[str]:
-    """
-    FIX #3 : Normalise le texte pour matcher les villes avec accents ou sans.
-    """
     t = normalize_text(text)
     for v in sorted(VILLES, key=len, reverse=True):
         if normalize_text(v) in t:
@@ -548,45 +638,26 @@ def extract_radius(text: str) -> float:
 
 def _needs_db(intent: str, domaine: Optional[str], location: Optional[str],
               ctx: Dict, wc: int) -> bool:
-    """
-    FIX #4 : Logique élargie — interroger la BDD dans plus de cas.
-    La règle est : NE PAS interroger seulement pour les salutations/politesses pures.
-    """
-    # Jamais pour les intents purement conversationnels
     HARD_SKIP = {"salutation", "remerciement", "aurevoir", "bot_info", "perso"}
     if intent in HARD_SKIP:
         return False
-
-    # Toujours si domaine ou ville détectée dans le message courant
     if domaine or location:
         return True
-
-    # Toujours si contexte domaine ou GPS mémorisé
     if ctx.get("last_domaine") or ctx.get("last_lat"):
         return True
-
-    # Toujours pour urgence et recherche
     if intent in {"urgence", "recherche"}:
         return True
-
-    # FIX #4 : Pour les messages généraux suffisamment longs, interroger aussi
-    # Ex: "tu as des garages ?" → intent=general mais mérite une réponse BDD
     if intent == "general" and wc >= 4:
         return True
-
-    # Pour FAQ avec contexte services (ex: "combien ça coûte ?" après une recherche)
     if intent == "faq" and ctx.get("last_services"):
         return True
-
     return False
 
 
 def intent_classify(text: str, ctx: Dict) -> str:
-    # FIX #1 : Normaliser pour la classification
     t  = normalize_text(text)
     wc = len(t.split())
 
-    # Salutations strictes
     SAL = ["bonjour", "bonsoir", "salut", "hello", "hi ", "salam", "alafia", "bonne journee"]
     if any(s in t for s in SAL) and wc <= 5:
         return "salutation"
@@ -604,10 +675,9 @@ def intent_classify(text: str, ctx: Dict) -> str:
     ]):
         return "bot_info"
 
-    if any(s in t for s in ["comment tu vas", "tu vas bien", "ca va", "ca va"]) and wc <= 5:
+    if any(s in t for s in ["comment tu vas", "tu vas bien", "ca va"]) and wc <= 5:
         return "perso"
 
-    # FAQ keywords — normalisés
     FAQ_KW = [
         "comment creer", "comment modifier", "comment supprimer", "comment payer",
         "comment annuler", "comment prendre", "comment envoyer", "comment activer",
@@ -617,14 +687,16 @@ def intent_classify(text: str, ctx: Dict) -> str:
         "essai gratuit", "rendez-vous", "prendre rdv", "creer service", "modifier service",
         "plan essenti", "plan profes", "plan premium", "tarif", "document requis",
         "ifu", "rccm", "certificat", "support careasy", "contacter careasy",
-        "creer une entreprise", "inscrire entreprise",
+        "creer une entreprise", "inscrire entreprise", "notification", "theme",
+        "mode sombre", "modifier profil", "changer photo", "connexion qr",
+        "navigation", "onglet", "parametres", "application", "comment utiliser",
+        "ou trouver", "ou est", "comment acceder",
     ]
     if sum(1 for kw in FAQ_KW if kw in t) >= 1:
         if extract_domaine(text) or extract_location(text):
             return "recherche"
         return "faq"
 
-    # Suivi conversationnel
     if ctx.get("last_services"):
         RANKS = [
             "premier", "deuxieme", "troisieme", "1er", "2eme", "3eme",
@@ -669,7 +741,6 @@ def intent_classify(text: str, ctx: Dict) -> str:
     if extract_domaine(text) or extract_location(text):
         return "recherche"
 
-    # Message court avec contexte domaine = continuation de recherche
     if ctx.get("last_domaine") and wc <= 5:
         return "recherche"
 
@@ -709,7 +780,7 @@ def resolve_ref(text: str, ctx: Dict) -> Optional[Dict]:
                 if len(word) >= 4 and word in t:
                     return s
 
-    FKWS = ["numero", "contact", "appeler", "adresse", "prix", "horaire", "itineraire"]
+    FKWS = ["numero", "contact", "appeler", "whatsapp", "telephone", "adresse", "prix", "horaire", "itineraire"]
     if len(text.split()) <= 6 and any(f in t for f in FKWS):
         return svcs[0]
 
@@ -769,7 +840,6 @@ async def geocode(location: str) -> Optional[Tuple[float, float]]:
     if key in _GEO:
         return _GEO[key]
 
-    # 1. Laravel BDD locale (priorité absolue)
     try:
         async with httpx.AsyncClient(timeout=8) as c:
             r = await c.get(
@@ -788,7 +858,6 @@ async def geocode(location: str) -> Optional[Tuple[float, float]]:
     except Exception as e:
         print(f"[GEO] Laravel: {e}")
 
-    # 2. Nominatim (OpenStreetMap)
     if USE_NOMINATIM:
         try:
             async with httpx.AsyncClient(timeout=8) as c:
@@ -798,7 +867,7 @@ async def geocode(location: str) -> Optional[Tuple[float, float]]:
                         "q": f"{location}, Bénin",
                         "format": "json", "limit": 1, "countrycodes": "bj"
                     },
-                    headers={"User-Agent": "CarEasy-CarAI/9.1"},
+                    headers={"User-Agent": "CarEasy-CarAI/9.2"},
                 )
                 if r.status_code == 200 and r.json():
                     d = r.json()[0]
@@ -808,7 +877,6 @@ async def geocode(location: str) -> Optional[Tuple[float, float]]:
         except Exception as e:
             print(f"[GEO] Nominatim: {e}")
 
-    # 3. Google Maps
     if GOOGLE_MAPS_KEY:
         try:
             async with httpx.AsyncClient(timeout=8) as c:
@@ -855,7 +923,7 @@ def dur(km: float) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  API LARAVEL — REQUÊTES BASE DE DONNÉES EN TEMPS RÉEL
+#  API LARAVEL
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def api_nearby(
@@ -883,13 +951,8 @@ async def api_nearby(
 
 
 def _normalize_service(s: Dict) -> Dict:
-    """
-    FIX #5 : Normalise un service quel que soit son format d'origine
-    (/ai/services ou /ai/services/nearby) et normalise le domaine.
-    """
     e = s.get("entreprise", {}) or {}
 
-    # Normaliser le domaine (peut être dict ou string)
     dom = s.get("domaine")
     if isinstance(dom, dict):
         dom = dom.get("name")
@@ -897,16 +960,13 @@ def _normalize_service(s: Dict) -> Dict:
     s_copy = dict(s)
     s_copy["domaine"] = dom
 
-    # Si l'entreprise a déjà latitude → format nearby, juste corriger l'adresse
     if isinstance(e, dict) and e.get("latitude") is not None:
         e_copy = dict(e)
-        # S'assurer que google_formatted_address est accessible comme "address"
         if not e_copy.get("address"):
             e_copy["address"] = e_copy.get("google_formatted_address")
         s_copy["entreprise"] = e_copy
         return s_copy
 
-    # Format /ai/services — reconstruire l'objet entreprise
     s_copy["entreprise"] = {
         "id":                       e.get("id"),
         "name":                     e.get("name"),
@@ -923,10 +983,6 @@ def _normalize_service(s: Dict) -> Dict:
 
 
 async def api_by_domaine(domaine: str, limit: int = 15) -> List[Dict]:
-    """
-    FIX #5 : Envoie le domaine tel quel à Laravel qui filtre par LIKE.
-    Essaie aussi avec le nom normalisé si aucun résultat.
-    """
     try:
         async with httpx.AsyncClient(timeout=15) as c:
             r = await c.get(
@@ -945,7 +1001,6 @@ async def api_by_domaine(domaine: str, limit: int = 15) -> List[Dict]:
 
 
 async def api_services_all(domaine: Optional[str] = None, limit: int = 20) -> List[Dict]:
-    """Fallback ultime — tous les services sans filtre GPS."""
     try:
         params: Dict[str, Any] = {"limit": limit}
         if domaine:
@@ -973,7 +1028,6 @@ async def api_domaines() -> List[str]:
 
 
 def clean_svc(s: Dict) -> Dict:
-    """FIX #5 : Sécurise tous les champs, gère les deux formats."""
     e = s.get("entreprise") or {}
 
     dist = s.get("distance_km")
@@ -986,7 +1040,6 @@ def clean_svc(s: Dict) -> Dict:
     if isinstance(domaine_val, dict):
         domaine_val = domaine_val.get("name")
 
-    # FIX #5 : lire l'adresse depuis google_formatted_address OU address
     address = (
         e.get("google_formatted_address")
         or e.get("address")
@@ -1051,36 +1104,47 @@ def fmt_rating(s: Dict) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  PROMPT SYSTÈME OLLAMA v9.1
+#  PROMPT SYSTÈME OLLAMA v9.2
+#  CORRECTION BUG #1 : Réponses hors-sujet → prompt ancré sur l'app mobile
+#  CORRECTION BUG #2 : Double réponse → Ollama REMPLACE le fallback, pas l'inverse
 # ═══════════════════════════════════════════════════════════════════════════════
 
-SYS = """Tu es CarAI, l'assistant intelligent de CarEasy Bénin.
+SYS = """Tu es CarAI, l'assistant de l'APPLICATION MOBILE CarEasy Bénin.
 
-IDENTITE :
-CarEasy connecte conducteurs et prestataires automobiles au Bénin.
-Tu parles comme un conseiller béninois de confiance : direct, chaleureux, humain.
-Pas de formules robotiques. Pas de discours corporate. Pas de "Je suis spécialisé dans...".
+CONTEXTE ABSOLU :
+CarEasy est une application mobile Flutter (Android & iOS) qui connecte conducteurs et prestataires automobiles au Bénin.
+Tu aides les utilisateurs à utiliser l'APPLICATION MOBILE CarEasy et à trouver des prestataires.
+Tu ne parles QUE de l'application CarEasy, de l'automobile et des services associés au Bénin.
 
-LANGUE : Réponds en français. En anglais si le client parle anglais.
+NAVIGATION DE L'APPLICATION :
+- Barre de navigation en bas : Accueil | Messages | Rendez-vous | Entreprise | Profil
+- Accueil : liste les services et entreprises, bouton Contacter et Détails
+- Messages : toutes les conversations avec les prestataires
+- Rendez-vous : gérer les RDV (En attente / Confirmé / Terminé / Annulé)
+- Entreprise : Mes entreprises, créer/gérer entreprise et services
+- Profil (Paramètres) : modifier profil, notifications, apparence, sécurité, plans, aide, à propos
+- CarAI : bouton flottant rouge en bas à droite de l'accueil
 
-STYLE :
-- Phrases courtes et naturelles. Varie tes formulations.
-- Donne les vrais contacts, prix et horaires directement.
-- Si tu ne sais pas quelque chose, dis-le simplement.
-- JAMAIS de "localhost" dans tes réponses — utilise {site_url}.
-- JAMAIS d'emojis — l'application mobile les gère elle-même.
+STYLE DE RÉPONSE :
+- Phrases courtes et naturelles, ton chaleureux et direct comme un conseiller béninois.
+- Donne les vrais contacts, prix et horaires directement sans détour.
+- Pour les questions sur l'app, donne le chemin de navigation exact (ex: "Onglet Profil → Paramètres → Notifications")
+- JAMAIS de "localhost" → utilise {site_url}
+- JAMAIS d'emojis (l'app les gère)
+- Si tu ne sais pas, dis-le simplement.
 
-REGLES ABSOLUES :
-1. Si la base de données contient des prestataires -> liste-les TOUS avec leurs contacts réels (téléphone, WhatsApp, adresse).
-2. Si aucun prestataire -> explique clairement et propose des alternatives.
-3. Ne réponds qu'aux sujets automobiles et CarEasy.
-4. Pour les questions de suivi, utilise les prestataires déjà présentés.
-5. Ne dis JAMAIS "je n'ai pas accès" ou "je ne peux pas voir" si des données sont fournies ci-dessous.
+RÈGLES ABSOLUES :
+1. Si des prestataires sont dans les DONNÉES CI-DESSOUS → liste-les TOUS avec contacts réels.
+2. Si aucun prestataire trouvé → explique et propose alternatives.
+3. Ne réponds qu'aux sujets : application CarEasy, automobile au Bénin, services auto.
+4. Pour les questions de suivi, utilise les prestataires déjà présentés dans CONTEXTE.
+5. Ne dis JAMAIS "je n'ai pas accès" si des données sont fournies ci-dessous.
+6. Tes réponses sont DÉFINITIVES — ne génère PAS d'introduction avant de lister, liste directement.
 
 CONTEXTE CONVERSATION :
 {ctx}
 
-DONNEES BASE DE DONNEES CAREASY (temps réel — utilise ces données) :
+DONNÉES BASE DE DONNÉES CAREASY (temps réel) :
 {db}
 
 INFORMATIONS PLATEFORME :
@@ -1219,7 +1283,8 @@ async def ask_ollama(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  FALLBACK RÈGLES
+#  FALLBACK RÈGLES — utilisé UNIQUEMENT si Ollama échoue ou est désactivé
+#  CORRECTION BUG #2 : Le fallback ne s'exécute JAMAIS en même temps qu'Ollama
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def fallback(
@@ -1252,9 +1317,9 @@ def fallback(
 
     if intent == "bot_info":
         return (
-            f"Je suis CarAI, l'assistant de CarEasy Bénin. "
+            f"Je suis CarAI, l'assistant de l'application mobile CarEasy Bénin. "
             f"Je vous aide à trouver des prestataires automobiles partout au Bénin "
-            f"et à utiliser la plateforme CarEasy. Site : {SITE_URL}"
+            f"et à utiliser l'application CarEasy. Site : {SITE_URL}"
         )
 
     if intent == "perso":
@@ -1265,7 +1330,7 @@ def fallback(
         if ans:
             return ans.replace("{site}", SITE_URL)
         return (
-            f"Pour cette question, consultez {SITE_URL} "
+            f"Pour cette question sur l'application CarEasy, consultez {SITE_URL} "
             "ou écrivez à support@careasy.bj. L'équipe répond en général dans la journée."
         )
 
@@ -1379,6 +1444,11 @@ def suggestions(domaine: Optional[str], location: Optional[str], ctx: Dict) -> L
     return final[:5]
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ENDPOINT PRINCIPAL — CORRECTION BUG #2 DOUBLE RÉPONSE
+#  Logique : Ollama OU fallback, jamais les deux
+# ═══════════════════════════════════════════════════════════════════════════════
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, bg: BackgroundTasks):
     t0 = time.time()
@@ -1434,7 +1504,6 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
                 services = await api_by_domaine(domaine, limit=15)
             if not services:
                 services = await api_services_all(domaine, limit=15)
-            # Calcul itinéraire vers le 1er résultat
             if services:
                 e0 = (services[0].get("entreprise") or {})
                 if e0.get("latitude") and e0.get("longitude"):
@@ -1479,12 +1548,11 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
             if not services:
                 services = await api_services_all(domaine, limit=15)
 
-        # CAS 5 : Aucun critère mais contexte domaine mémorisé
+        # CAS 5 : Contexte domaine mémorisé
         elif ctx.get("last_domaine") and intent not in {"faq", "general"}:
             services = await api_by_domaine(ctx["last_domaine"], limit=10)
 
-        # FIX #4 : CAS 6 — message général sufisamment long sans critère détecté
-        # Ex: "tu as quoi comme services ?" → retourner tous les services
+        # CAS 6 : Message général suffisamment long
         elif intent == "general" and wc >= 4:
             services = await api_services_all(limit=10)
 
@@ -1496,6 +1564,10 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
     if intent in {"faq", "general", "bot_info"}:
         faq_hint = faq_lookup(req.message)
 
+    # ─────────────────────────────────────────────────────────────────────
+    # CORRECTION BUG #2 : Ollama SEUL si disponible, fallback UNIQUEMENT sinon
+    # Avant : fallback() était appelé PUIS ask_ollama() → double réponse possible
+    # ─────────────────────────────────────────────────────────────────────
     reply = await ask_ollama(
         user_msg=req.message,
         ctx=ctx,
@@ -1506,6 +1578,7 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
         faq_hint=faq_hint,
     )
 
+    # Fallback activé UNIQUEMENT si Ollama retourne None
     if not reply:
         reply = fallback(
             intent=intent,
@@ -1521,6 +1594,7 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
             ulng=req.longitude,
         )
 
+    # Nettoyage final — aucun lien localhost dans la réponse
     reply = re.sub(r"http://localhost[^\s]*", SITE_URL, reply)
     reply = re.sub(r"localhost:\d+", SITE_URL, reply)
 
@@ -1552,6 +1626,7 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
         f"[CHAT] {req.conversation_id[:12]} | intent={intent} | "
         f"domaine={domaine or '-'} | loc={location or '-'} | "
         f"services={len(active)} | db={'oui' if should_query_db else 'non'} | "
+        f"{'ollama' if _LEARN['stats']['ollama_ok'] > 0 else 'fallback'} | "
         f"{elapsed:.2f}s"
     )
 
@@ -1565,6 +1640,7 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
         suggestions=suggestions(domaine, location, ctx),
         confidence=_confidence(req.message, intent),
     )
+
 
 @app.post("/feedback")
 async def feedback_endpoint(req: FeedbackRequest, bg: BackgroundTasks):
@@ -1613,7 +1689,7 @@ async def health():
 
     return {
         "status":      "ok",
-        "version":     "9.1.0",
+        "version":     "9.2.0",
         "mode":        "ollama+rules+db" if ollama_ok else "rules+db",
         "redis":       redis_ok,
         "ollama":      ollama_ok,
@@ -1761,7 +1837,7 @@ async def test_ep():
 
     results["redis"]        = "Connecté" if redis_client else "RAM actif (non bloquant)"
     results["site_url"]     = SITE_URL
-    results["version"]      = "9.1.0"
+    results["version"]      = "9.2.0"
     results["kw2dom_count"] = str(len(KW2DOM))
 
-    return {"version": "9.1.0", "tests": results}
+    return {"version": "9.2.0", "tests": results}
