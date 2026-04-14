@@ -1,3 +1,12 @@
+"""
+CarAI v10.0 — Assistant CarEasy Bénin
+• Autonome (sans Ollama) — moteur NLP + règles + templates enrichis
+• Diagnostic automobile intégré (arbre de décision + base de symptômes)
+• Icônes professionnelles SVG (aucun emoji)
+• Recherche robuste en cascade (8 niveaux)
+• Apprentissage non supervisé persistant
+"""
+
 import os, json, re, math, httpx, time, hashlib, random
 import unicodedata
 import redis.asyncio as aioredis
@@ -15,13 +24,11 @@ LARAVEL_BASE    = os.getenv("LARAVEL_API_URL",  "https://careasy26.alwaysdata.ne
 REDIS_URL       = os.getenv("REDIS_URL",        "redis://default:AZExAAIncDE1M2I2MDYzOGQyYzg0ZTNiOTNhYzg4OWU5MjUzZTlhYnAxMzcxNjk@on-turtle-37169.upstash.io:6379")
 USE_NOMINATIM   = os.getenv("USE_NOMINATIM",    "true").lower() == "true"
 GOOGLE_MAPS_KEY = os.getenv("GOOGLE_MAPS_KEY",  "")
-OLLAMA_URL      = os.getenv("OLLAMA_URL",       "http://localhost:11434")
-OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL",     "llama3")
-USE_OLLAMA      = os.getenv("USE_OLLAMA",       "true").lower() == "true"
 SITE_URL        = os.getenv("FRONTEND_URL",     "https://careasy.vercel.app")
-LEARN_FILE      = os.getenv("LEARN_FILE",       "/tmp/carai_learn_v9.json")
+LEARN_FILE      = os.getenv("LEARN_FILE",       "/tmp/carai_learn_v10.json")
+APP_VERSION     = "10.0.0"
 
-app = FastAPI(title="CarAI v9.3", version="9.3.0", docs_url="/docs")
+app = FastAPI(title="CarAI v10.0", version=APP_VERSION, docs_url="/docs")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
@@ -38,16 +45,18 @@ _LEARN: Dict[str, Any] = {
     "intent_clusters": {},
     "faq_corrections": {},
     "query_stats":     {},
+    "diag_stats":      {},
     "stats": {
-        "total": 0, "ollama_ok": 0, "fallback": 0,
+        "total": 0, "fallback": 0,
         "db_hits": 0, "db_misses": 0,
         "feedback_pos": 0, "feedback_neg": 0,
+        "diag_queries": 0,
     },
 }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  UTILITAIRE — Normalisation texte
+#  UTILITAIRES
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def normalize_text(text: str) -> str:
@@ -56,7 +65,6 @@ def normalize_text(text: str) -> str:
                .replace("\u02BC", "'").replace("\u0060", "'") \
                .replace("\u00B4", "'")
     text = text.replace("\u2013", "-").replace("\u2014", "-")
-    # Supprimer les accents pour la comparaison
     nfkd = unicodedata.normalize("NFKD", text)
     text_no_accent = "".join(c for c in nfkd if not unicodedata.combining(c))
     return text_no_accent.lower()
@@ -83,6 +91,7 @@ class ChatResponse(BaseModel):
     language:    Optional[str]        = None
     suggestions: List[str]            = []
     confidence:  float                = 1.0
+    diagnostic:  Optional[Dict]       = None
 
 class FeedbackRequest(BaseModel):
     conversation_id: str
@@ -90,6 +99,12 @@ class FeedbackRequest(BaseModel):
     reply_text:      str
     rating:          int
     comment:         Optional[str] = None
+
+class DiagRequest(BaseModel):
+    symptoms:  List[str]
+    vehicle:   Optional[str] = None
+    mileage:   Optional[int] = None
+    year:      Optional[int] = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -110,32 +125,16 @@ async def startup():
         redis_client = None
 
     _load_learn()
-
-    if USE_OLLAMA:
-        try:
-            async with httpx.AsyncClient(timeout=5) as c:
-                r = await c.get(f"{OLLAMA_URL}/api/tags")
-                if r.status_code == 200:
-                    models = [m["name"] for m in r.json().get("models", [])]
-                    ok = any(OLLAMA_MODEL in m for m in models)
-                    print(f"[CarAI] Ollama '{OLLAMA_MODEL}' {'OK' if ok else 'ABSENT — mode fallback actif'}")
-                else:
-                    print(f"[CarAI] Ollama KO (HTTP {r.status_code}) — mode fallback actif")
-        except Exception as e:
-            print(f"[CarAI] Ollama KO ({e}) — mode fallback actif")
-
-    print(f"[CarAI] v9.3 | {LARAVEL_BASE} | Ollama={'ON' if USE_OLLAMA else 'OFF'}")
+    print(f"[CarAI] v{APP_VERSION} | {LARAVEL_BASE} | Mode autonome (sans Ollama)")
 
     try:
         async with httpx.AsyncClient(timeout=8) as c:
             r = await c.get(f"{LARAVEL_BASE}/ai/domaines")
             if r.status_code == 200:
                 nb = len(r.json().get("data", []))
-                print(f"[CarAI] Laravel OK — {nb} domaines disponibles")
-            else:
-                print(f"[CarAI] ATTENTION: Laravel répond {r.status_code} sur /ai/domaines")
+                print(f"[CarAI] Laravel OK — {nb} domaines")
     except Exception as e:
-        print(f"[CarAI] ATTENTION: Laravel inaccessible au démarrage: {e}")
+        print(f"[CarAI] ATTENTION: Laravel inaccessible: {e}")
 
     try:
         async with httpx.AsyncClient(timeout=8) as c:
@@ -145,22 +144,7 @@ async def startup():
             )
             if r.status_code == 200:
                 nb = len(r.json().get("data", []))
-                print(f"[CarAI] BDD OK — {nb} services trouvés près de Cotonou")
-                if nb == 0:
-                    print("[CarAI] ATTENTION: 0 services — vérifiez status=validated ET coords GPS")
-            else:
-                print(f"[CarAI] ATTENTION: /ai/services/nearby répond {r.status_code}")
-    except Exception as e:
-        print(f"[CarAI] ATTENTION: Test services/nearby échoué: {e}")
-
-    try:
-        async with httpx.AsyncClient(timeout=8) as c:
-            r = await c.get(f"{LARAVEL_BASE}/ai/services", params={"limit": 3})
-            if r.status_code == 200:
-                nb = len(r.json().get("data", []))
-                print(f"[CarAI] Fallback /ai/services OK — {nb} services disponibles")
-    except Exception as e:
-        print(f"[CarAI] ATTENTION: Test /ai/services échoué: {e}")
+                print(f"[CarAI] BDD OK — {nb} services près de Cotonou")
 
 
 @app.on_event("shutdown")
@@ -244,7 +228,531 @@ def _confidence(message: str, intent: str) -> float:
     if key in _LEARN["pattern_scores"]:
         return max(0.1, min(1.0, _LEARN["pattern_scores"][key]["score"] / 5.0))
     n = len(_LEARN["intent_clusters"].get(intent, []))
-    return 0.9 if n > 20 else (0.8 if n > 10 else 0.70)
+    return 0.9 if n > 20 else (0.8 if n > 10 else 0.75)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BASE DE DIAGNOSTIC AUTOMOBILE — Moteur de règles robuste
+#  Couvre les pannes les plus fréquentes au Bénin
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DIAG_SYMPTOMS: Dict[str, Dict] = {
+    # ── MOTEUR ──────────────────────────────────────────────────────────────
+    "moteur_ne_demarre_pas": {
+        "keywords": [
+            "ne demarre pas", "ne demarr", "ne veut pas demarrer", "voiture ne start",
+            "moteur mort", "clic clic", "rien quand je tourne la cle",
+            "le demarreur tourne mais", "demarre pas", "start pas"
+        ],
+        "titre": "Moteur ne démarre pas",
+        "icon": "engine",
+        "urgence": "haute",
+        "causes_probables": [
+            {"cause": "Batterie déchargée ou défectueuse", "probabilite": 60, "icon": "battery"},
+            {"cause": "Démarreur défaillant", "probabilite": 20, "icon": "gear"},
+            {"cause": "Problème d'injection / carburant vide", "probabilite": 12, "icon": "fuel"},
+            {"cause": "Calage de la distribution", "probabilite": 5, "icon": "wrench"},
+            {"cause": "Immobiliseur / clé non reconnue", "probabilite": 3, "icon": "key"},
+        ],
+        "diagnostic_rapide": [
+            "Les phares s'allument-ils normalement ?",
+            "Entendez-vous un 'clic clic' ou silence total au démarrage ?",
+            "La dernière recharge de batterie date de quand ?",
+            "Y a-t-il du carburant dans le réservoir ?",
+        ],
+        "actions_immediates": [
+            "Vérifier la tension de batterie (doit être > 12,4V)",
+            "Essayer un démarrage en poussette ou câbles de démarrage",
+            "Vérifier le niveau de carburant",
+            "Vérifier les bornes de batterie (oxydation)",
+        ],
+        "domaine_recommande": "Garage mecanique",
+        "cout_estimatif": "5 000 – 150 000 FCFA selon la cause",
+        "delai_recommande": "Immédiat",
+    },
+
+    "surchauffe_moteur": {
+        "keywords": [
+            "temperature monte", "surchauffe", "moteur chauffe", "jauge temperature rouge",
+            "vapeur moteur", "fumee blanche moteur", "radiateur chauffe",
+            "voyant temperature", "moteur en surchauffe", "thermometre monte"
+        ],
+        "titre": "Surchauffe moteur",
+        "icon": "temperature",
+        "urgence": "critique",
+        "causes_probables": [
+            {"cause": "Niveau de liquide de refroidissement bas", "probabilite": 40, "icon": "droplet"},
+            {"cause": "Thermostat bloqué fermé", "probabilite": 20, "icon": "gear"},
+            {"cause": "Fuite du circuit de refroidissement", "probabilite": 18, "icon": "alert"},
+            {"cause": "Pompe à eau défaillante", "probabilite": 12, "icon": "wrench"},
+            {"cause": "Joint de culasse percé", "probabilite": 10, "icon": "alert"},
+        ],
+        "diagnostic_rapide": [
+            "Y a-t-il de la fumée blanche sortant du capot ou du pot d'échappement ?",
+            "Le niveau de liquide de refroidissement est-il bas ?",
+            "Y a-t-il des traces de fuite sous la voiture ?",
+            "Le ventilateur de refroidissement fonctionne-t-il ?",
+        ],
+        "actions_immediates": [
+            "ARRÊT IMMÉDIAT du véhicule — continuer endommage le moteur",
+            "NE PAS ouvrir le bouchon du radiateur à chaud (risque de brûlure)",
+            "Attendre refroidissement complet (20-30 min minimum)",
+            "Vérifier le niveau de liquide de refroidissement à froid",
+            "Appeler un dépanneur si fuite visible",
+        ],
+        "domaine_recommande": "Garage mecanique",
+        "cout_estimatif": "15 000 – 500 000 FCFA (joint de culasse = coût élevé)",
+        "delai_recommande": "Immédiat — ne pas rouler",
+    },
+
+    "consommation_huile_excessive": {
+        "keywords": [
+            "huile diminue", "perd de l huile", "fumee bleue", "fumee noire",
+            "consomme huile", "voyant huile allume", "niveau huile bas",
+            "huile moteur baisse", "manque huile", "brule huile"
+        ],
+        "titre": "Consommation d'huile excessive / voyant huile",
+        "icon": "oil",
+        "urgence": "haute",
+        "causes_probables": [
+            {"cause": "Segments pistons usés (fumée bleue)", "probabilite": 35, "icon": "wrench"},
+            {"cause": "Joints de soupapes défaillants", "probabilite": 28, "icon": "wrench"},
+            {"cause": "Fuite externe (joints, couvre-culasse)", "probabilite": 22, "icon": "alert"},
+            {"cause": "Vidange dépassée / huile dégradée", "probabilite": 10, "icon": "oil"},
+            {"cause": "Niveau bas sans fuite (vidange nécessaire)", "probabilite": 5, "icon": "info"},
+        ],
+        "diagnostic_rapide": [
+            "Y a-t-il de la fumée bleue au démarrage à froid ?",
+            "Des traces d'huile sous le véhicule ?",
+            "Quand a été faite la dernière vidange ?",
+            "Le voyant huile (rouge) est-il allumé en roulant ?",
+        ],
+        "actions_immediates": [
+            "Vérifier le niveau d'huile immédiatement (jauge)",
+            "Si niveau très bas : ARRÊT et appoint avant de rouler",
+            "Vérifier les traces de fuite sous le moteur",
+            "Programmer une vidange si > 10 000 km",
+        ],
+        "domaine_recommande": "Changement d'huile",
+        "cout_estimatif": "8 000 – 200 000 FCFA",
+        "delai_recommande": "Cette semaine",
+    },
+
+    "frein_probleme": {
+        "keywords": [
+            "frein dur", "frein mou", "frein grince", "frein crie", "pedal frein",
+            "pedale s enfonce", "voiture ne freine pas", "frein chauffe",
+            "bruit frein", "freinage mauvais", "ABS", "freins usés",
+            "plaquettes", "disque frein", "freins"
+        ],
+        "titre": "Problème de freinage",
+        "icon": "brake",
+        "urgence": "critique",
+        "causes_probables": [
+            {"cause": "Plaquettes de frein usées", "probabilite": 40, "icon": "wrench"},
+            {"cause": "Disques de frein usés ou voilés", "probabilite": 22, "icon": "gear"},
+            {"cause": "Fuite de liquide de frein", "probabilite": 18, "icon": "alert"},
+            {"cause": "Liquide de frein dégradé (bouillonnement)", "probabilite": 10, "icon": "droplet"},
+            {"cause": "Étrier de frein bloqué", "probabilite": 10, "icon": "wrench"},
+        ],
+        "diagnostic_rapide": [
+            "La pédale s'enfonce-t-elle progressivement (pédale molle) ?",
+            "Y a-t-il un bruit de grincement ou couinement ?",
+            "La voiture tire-t-elle d'un côté au freinage ?",
+            "Le voyant ABS ou frein est-il allumé ?",
+        ],
+        "actions_immediates": [
+            "SÉCURITÉ CRITIQUE — réduire vitesse et éviter les autoroutes",
+            "Vérifier le niveau de liquide de frein (réservoir transparent)",
+            "Si pédale molle : ne pas rouler, appeler dépanneur",
+            "Éviter les descentes prolongées sans frein moteur",
+        ],
+        "domaine_recommande": "Garage mecanique",
+        "cout_estimatif": "20 000 – 150 000 FCFA",
+        "delai_recommande": "Immédiat — sécurité",
+    },
+
+    "pneu_probleme": {
+        "keywords": [
+            "pneu crev", "creve", "roue crevee", "pneu plat", "pneu gonfle",
+            "pression pneu", "pneu user", "bande pneu", "vibration pneu",
+            "voiture penche", "pneu eclate", "valve pneu"
+        ],
+        "titre": "Problème de pneumatiques",
+        "icon": "tire",
+        "urgence": "variable",
+        "causes_probables": [
+            {"cause": "Crevaison simple (clou, vis)", "probabilite": 50, "icon": "alert"},
+            {"cause": "Valve défaillante (perte lente)", "probabilite": 20, "icon": "gear"},
+            {"cause": "Pneu usé / bande de roulement lisse", "probabilite": 18, "icon": "wrench"},
+            {"cause": "Jante abîmée (bosse, voile)", "probabilite": 7, "icon": "wrench"},
+            {"cause": "Crevaison interne (flanc endommagé)", "probabilite": 5, "icon": "alert"},
+        ],
+        "diagnostic_rapide": [
+            "Le pneu est-il complètement à plat ou se dégonfle-t-il progressivement ?",
+            "Y a-t-il un clou ou un objet visible dans le pneu ?",
+            "La crevaison est-elle sur le flanc ou la bande centrale ?",
+            "La roue de secours est-elle disponible et gonflée ?",
+        ],
+        "actions_immediates": [
+            "S'arrêter en sécurité hors de la chaussée",
+            "Allumer les feux de détresse",
+            "Monter la roue de secours si disponible",
+            "Appeler un vulcanisateur si pas de roue de secours",
+        ],
+        "domaine_recommande": "Pneumatique / vulcanisation",
+        "cout_estimatif": "1 000 – 50 000 FCFA (réparation/remplacement)",
+        "delai_recommande": "Immédiat",
+    },
+
+    "batterie_probleme": {
+        "keywords": [
+            "batterie", "batterie faible", "batterie morte", "batterie decharge",
+            "phares faibles", "alarme sonne", "radio s eteint", "alternateur",
+            "voyant batterie", "batterie vide", "charge batterie"
+        ],
+        "titre": "Problème électrique / batterie",
+        "icon": "battery",
+        "urgence": "moyenne",
+        "causes_probables": [
+            {"cause": "Batterie déchargée (ancienneté > 3 ans)", "probabilite": 45, "icon": "battery"},
+            {"cause": "Alternateur défaillant (ne recharge pas)", "probabilite": 28, "icon": "gear"},
+            {"cause": "Consommateur parasite (lumière restée allumée)", "probabilite": 15, "icon": "info"},
+            {"cause": "Mauvaise connexion des bornes", "probabilite": 7, "icon": "wrench"},
+            {"cause": "Régulateur de tension défaillant", "probabilite": 5, "icon": "gear"},
+        ],
+        "diagnostic_rapide": [
+            "La batterie a-t-elle plus de 3 ans ?",
+            "Le voyant batterie (rouge) est-il allumé en roulant ?",
+            "Les phares brillent-ils normalement moteur en marche ?",
+            "Le démarrage est-il difficile (moteur tourne lentement) ?",
+        ],
+        "actions_immediates": [
+            "Tester la tension batterie (bon état : 12,6V à vide, 13,5-14,5V moteur tournant)",
+            "Vérifier l'état des bornes (pas d'oxydation blanche)",
+            "Si alternateur suspect : ne pas couper le moteur",
+            "Prévoir remplacement si batterie > 4 ans",
+        ],
+        "domaine_recommande": "Electricien auto",
+        "cout_estimatif": "15 000 – 80 000 FCFA (batterie)",
+        "delai_recommande": "Cette semaine",
+    },
+
+    "bruit_suspect": {
+        "keywords": [
+            "bruit bizarre", "bruit moteur", "bruit cliquetis", "cognement",
+            "toc toc moteur", "sifflement", "grondement", "vibration voiture",
+            "bruit au virage", "craquement", "bruit suspension", "bruit en roulant",
+            "bruit direction", "bruit frein", "bruit bizarre voiture"
+        ],
+        "titre": "Bruit suspect / anomalie sonore",
+        "icon": "sound",
+        "urgence": "moyenne",
+        "causes_probables": [
+            {"cause": "Roulement de roue usé (grondement en virage)", "probabilite": 30, "icon": "gear"},
+            {"cause": "Cardans défaillants (cliquetis en virage)", "probabilite": 22, "icon": "gear"},
+            {"cause": "Silentblocs / amortisseurs usés (bruit suspension)", "probabilite": 20, "icon": "wrench"},
+            {"cause": "Courroie de distribution usée (cliquetis moteur)", "probabilite": 15, "icon": "alert"},
+            {"cause": "Échappement percé (sifflement/grondement)", "probabilite": 13, "icon": "wrench"},
+        ],
+        "diagnostic_rapide": [
+            "Le bruit apparaît-il surtout en virage, en freinage ou en permanence ?",
+            "Est-ce un cliquetis métallique, un grondement sourd ou un sifflement ?",
+            "Le bruit augmente-t-il avec la vitesse ?",
+            "Est-ce récent ou progressif depuis plusieurs semaines ?",
+        ],
+        "actions_immediates": [
+            "Un cliquetis métallique rapide = URGENT (distribution ou moteur)",
+            "Un grondement en virage = roulement à surveiller (risque de blocage)",
+            "Éviter les longs trajets avant diagnostic",
+            "Faire un diagnostic électronique pour lire les codes erreur",
+        ],
+        "domaine_recommande": "Diagnostic automobile",
+        "cout_estimatif": "5 000 – 300 000 FCFA selon l'origine",
+        "delai_recommande": "Dans la semaine",
+    },
+
+    "voyant_allume": {
+        "keywords": [
+            "voyant allume", "voyant rouge", "voyant orange", "check engine",
+            "voyant moteur", "tableau de bord allume", "lampe allumee tableau",
+            "warning allume", "voyant", "code erreur", "obd", "scanner"
+        ],
+        "titre": "Voyant(s) allumé(s) tableau de bord",
+        "icon": "warning",
+        "urgence": "variable",
+        "causes_probables": [
+            {"cause": "Capteur défaillant (O2, MAF, température)", "probabilite": 35, "icon": "sensor"},
+            {"cause": "Problème système dépollution (FAP, catalyseur)", "probabilite": 25, "icon": "exhaust"},
+            {"cause": "Pression huile ou température anormale", "probabilite": 18, "icon": "alert"},
+            {"cause": "Problème système de freinage (ABS/ESP)", "probabilite": 12, "icon": "brake"},
+            {"cause": "Défaut électrique mineur (contacteur, capteur)", "probabilite": 10, "icon": "electric"},
+        ],
+        "diagnostic_rapide": [
+            "Le voyant est-il ROUGE (urgence) ou ORANGE/JAUNE (avertissement) ?",
+            "Plusieurs voyants sont-ils allumés simultanément ?",
+            "Y a-t-il une perte de puissance moteur associée ?",
+            "Le voyant clignote-t-il ou est-il fixe ?",
+        ],
+        "actions_immediates": [
+            "ROUGE fixe ou clignotant = arrêt immédiat recommandé",
+            "ORANGE/JAUNE fixe = diagnostic dans les 48h",
+            "Ne pas effacer les codes erreur avant diagnostic (perte d'information)",
+            "Faire lire les codes OBD par un professionnel",
+        ],
+        "domaine_recommande": "Diagnostic automobile",
+        "cout_estimatif": "3 000 – 200 000 FCFA selon le défaut",
+        "delai_recommande": "Selon couleur du voyant",
+    },
+
+    "climatisation_probleme": {
+        "keywords": [
+            "clim ne refroidit pas", "clim ne fonctionne pas", "clim chaude",
+            "air conditionne ne marche pas", "recharger clim", "gaz clim",
+            "clim souffle chaud", "mauvaise climatisation", "clim inefficace",
+            "odeur clim", "clim fait du bruit"
+        ],
+        "titre": "Climatisation défaillante",
+        "icon": "ac",
+        "urgence": "basse",
+        "causes_probables": [
+            {"cause": "Gaz réfrigérant insuffisant (fuite ou recharge nécessaire)", "probabilite": 50, "icon": "droplet"},
+            {"cause": "Condenseur encrassé ou endommagé", "probabilite": 20, "icon": "wrench"},
+            {"cause": "Compresseur défaillant", "probabilite": 15, "icon": "gear"},
+            {"cause": "Filtre habitacle encrassé", "probabilite": 10, "icon": "filter"},
+            {"cause": "Résistance de ventilateur défaillante", "probabilite": 5, "icon": "electric"},
+        ],
+        "diagnostic_rapide": [
+            "La clim souffle-t-elle de l'air mais pas froid ?",
+            "Y a-t-il un sifflement ou bruit inhabituel quand la clim est allumée ?",
+            "Des mauvaises odeurs à la mise en route ?",
+            "Quand la clim a-t-elle été rechargée pour la dernière fois ?",
+        ],
+        "actions_immediates": [
+            "Vérifier que le compresseur s'enclenche (embrayage magnétique)",
+            "Inspecter le condenseur (devant du radiateur) — nettoyage si encrassé",
+            "Changer le filtre d'habitacle si > 15 000 km ou 1 an",
+            "Recharge de gaz recommandée tous les 2 ans",
+        ],
+        "domaine_recommande": "Climatisation auto",
+        "cout_estimatif": "10 000 – 120 000 FCFA",
+        "delai_recommande": "Cette semaine",
+    },
+
+    "panne_electrique": {
+        "keywords": [
+            "phare ne marche pas", "clignotant", "essuie glace", "vitres electriques",
+            "verrouillage porte", "centrale clignotant", "fusible grille",
+            "court circuit", "tableau de bord eteint", "ordinateur bord",
+            "probleme electrique", "prise obd", "calculateur"
+        ],
+        "titre": "Panne électrique",
+        "icon": "electric",
+        "urgence": "variable",
+        "causes_probables": [
+            {"cause": "Fusible grillé", "probabilite": 40, "icon": "fuse"},
+            {"cause": "Relais défaillant", "probabilite": 25, "icon": "gear"},
+            {"cause": "Câblage endommagé (rongeurs, humidité)", "probabilite": 20, "icon": "cable"},
+            {"cause": "Calculateur défaillant", "probabilite": 10, "icon": "chip"},
+            {"cause": "Masse carrosserie desserrée", "probabilite": 5, "icon": "wrench"},
+        ],
+        "diagnostic_rapide": [
+            "L'équipement défaillant est-il seul ou plusieurs en même temps ?",
+            "Le problème est-il intermittent ou permanent ?",
+            "Y a-t-il eu récemment de l'eau dans l'habitacle ?",
+            "Y a-t-il une odeur de brûlé ?",
+        ],
+        "actions_immediates": [
+            "Vérifier en premier le coffret à fusibles (capot et habitacle)",
+            "Identifier le fusible correspondant dans le guide utilisateur",
+            "Ne pas remplacer un fusible par un ampérage supérieur",
+            "Si odeur de brûlé : déconnecter la batterie et appeler un électricien auto",
+        ],
+        "domaine_recommande": "Electricien auto",
+        "cout_estimatif": "2 000 – 150 000 FCFA",
+        "delai_recommande": "Selon gravité",
+    },
+
+    "transmission_probleme": {
+        "keywords": [
+            "boite vitesse", "vitesse ne passe pas", "rapport dur", "boite automatique",
+            "transmission", "embrayage patine", "embrayage dur", "glisse embrayage",
+            "pedale embrayage", "marche arriere", "boite de vitesse"
+        ],
+        "titre": "Problème boîte de vitesses / transmission",
+        "icon": "transmission",
+        "urgence": "haute",
+        "causes_probables": [
+            {"cause": "Embrayage usé (patinage, prise haute)", "probabilite": 40, "icon": "gear"},
+            {"cause": "Câble ou tringlerie de boîte mal réglée", "probabilite": 20, "icon": "wrench"},
+            {"cause": "Huile de boîte insuffisante ou dégradée", "probabilite": 18, "icon": "oil"},
+            {"cause": "Synchroniseurs usés (passages durs)", "probabilite": 14, "icon": "gear"},
+            {"cause": "Boîte automatique : capteur ou solénoïde", "probabilite": 8, "icon": "chip"},
+        ],
+        "diagnostic_rapide": [
+            "Le problème est-il au passage de rapport ou à la prise de mouvement ?",
+            "Y a-t-il une odeur de brûlé lors de la montée en côte ?",
+            "Le régime moteur monte-t-il sans que la vitesse augmente ?",
+            "La pédale d'embrayage est-elle molle ou très haute ?",
+        ],
+        "actions_immediates": [
+            "Éviter les côtes abruptes si l'embrayage patine",
+            "Vérifier le niveau d'huile de boîte (sous le capot ou dessous)",
+            "Ne pas forcer les passages de rapport (endommage les synchroniseurs)",
+            "Diagnostic professionnel recommandé avant aggravation",
+        ],
+        "domaine_recommande": "Garage mecanique",
+        "cout_estimatif": "50 000 – 400 000 FCFA",
+        "delai_recommande": "Dans la semaine",
+    },
+
+    "direction_suspension": {
+        "keywords": [
+            "direction dure", "volant tremble", "volant tire", "alignement",
+            "geometrie", "amortisseur", "suspension", "voiture oscille",
+            "tient mal la route", "craquement volant", "pneu mange",
+            "usure inégale pneu", "direction assistee"
+        ],
+        "titre": "Direction et suspension",
+        "icon": "steering",
+        "urgence": "moyenne",
+        "causes_probables": [
+            {"cause": "Amortisseurs usés (oscillation, bruit)", "probabilite": 35, "icon": "wrench"},
+            {"cause": "Parallélisme / géométrie déréglée", "probabilite": 28, "icon": "alignment"},
+            {"cause": "Rotule de direction usée", "probabilite": 18, "icon": "gear"},
+            {"cause": "Direction assistée défaillante (huile, pompe)", "probabilite": 12, "icon": "oil"},
+            {"cause": "Triangle de suspension endommagé", "probabilite": 7, "icon": "wrench"},
+        ],
+        "diagnostic_rapide": [
+            "La voiture tire-t-elle d'un côté sur route droite ?",
+            "Y a-t-il des vibrations dans le volant à partir de 80 km/h ?",
+            "Les pneus s'usent-ils de manière inégale (d'un côté seulement) ?",
+            "Y a-t-il des craquements en tournant à basse vitesse ?",
+        ],
+        "actions_immediates": [
+            "Vérifier le niveau de liquide de direction assistée",
+            "Inspecter les pneus pour l'usure asymétrique",
+            "Vérifier que les roues ne vibrent pas en les secouant à la main",
+            "Réaliser un parallélisme après tout changement de pneus",
+        ],
+        "domaine_recommande": "Garage mecanique",
+        "cout_estimatif": "15 000 – 200 000 FCFA",
+        "delai_recommande": "Dans la semaine",
+    },
+}
+
+# Index de recherche rapide
+DIAG_KEYWORD_INDEX: Dict[str, str] = {}
+for code, data in DIAG_SYMPTOMS.items():
+    for kw in data["keywords"]:
+        DIAG_KEYWORD_INDEX[normalize_text(kw)] = code
+
+
+def detect_diagnostic_intent(text: str) -> Optional[str]:
+    """Retourne le code de diagnostic si la question est un diagnostic, sinon None."""
+    t = normalize_text(text)
+    best_code, best_score = None, 0
+
+    # Recherche par mots-clés (triés par longueur décroissante)
+    for kw in sorted(DIAG_KEYWORD_INDEX.keys(), key=len, reverse=True):
+        if kw in t:
+            code = DIAG_KEYWORD_INDEX[kw]
+            score = len(kw)
+            if score > best_score:
+                best_score = score
+                best_code = code
+
+    # Si la question est clairement un problème auto (mots indicateurs)
+    DIAG_TRIGGERS = [
+        "probleme", "panne", "ne fonctionne", "ne marche", "grince", "vibre",
+        "clignote", "allume", "fuit", "fume", "chauffe", "bruit", "voyant",
+        "pourquoi ma", "pourquoi mon", "diagnostiquer", "qu est ce qui",
+        "que se passe", "diagnosis", "symptome", "defaut", "anomalie"
+    ]
+    is_diag_context = any(trigger in t for trigger in DIAG_TRIGGERS)
+
+    if best_code and (best_score >= 4 or is_diag_context):
+        return best_code
+
+    return None
+
+
+def build_diagnostic_response(diag_code: str, services: List[Dict], location: Optional[str], ulat: Optional[float]) -> Tuple[str, Dict]:
+    """Construit une réponse de diagnostic complète avec recommandations de prestataires."""
+    diag = DIAG_SYMPTOMS[diag_code]
+    _LEARN["stats"]["diag_queries"] += 1
+    _LEARN["diag_stats"][diag_code] = _LEARN["diag_stats"].get(diag_code, 0) + 1
+
+    lines = []
+
+    # En-tête
+    urgence_label = {
+        "critique": "CRITIQUE — ne pas rouler",
+        "haute":    "HAUTE — intervention rapide",
+        "moyenne":  "MOYENNE — à surveiller",
+        "basse":    "NON URGENTE — entretien préventif",
+        "variable": "VARIABLE — dépend du voyant",
+    }.get(diag["urgence"], "À évaluer")
+
+    lines.append(f"Diagnostic : {diag['titre']}")
+    lines.append(f"Niveau d'urgence : {urgence_label}")
+    lines.append("")
+
+    # Causes probables (top 3)
+    lines.append("Causes probables :")
+    for i, cause in enumerate(diag["causes_probables"][:3], 1):
+        bar = "█" * (cause["probabilite"] // 10) + "░" * (10 - cause["probabilite"] // 10)
+        lines.append(f"{i}. {cause['cause']} — {cause['probabilite']}%")
+        lines.append(f"   [{bar}]")
+
+    lines.append("")
+
+    # Questions de diagnostic
+    lines.append("Pour affiner le diagnostic, répondez à ces questions :")
+    for i, q in enumerate(diag["diagnostic_rapide"][:3], 1):
+        lines.append(f"Q{i}. {q}")
+
+    lines.append("")
+
+    # Actions immédiates (top 3)
+    lines.append("Actions immédiates :")
+    for action in diag["actions_immediates"][:3]:
+        lines.append(f"- {action}")
+
+    lines.append("")
+    lines.append(f"Coût estimatif : {diag['cout_estimatif']}")
+    lines.append(f"Délai recommandé : {diag['delai_recommande']}")
+
+    # Recommandation prestataire
+    domaine_rec = diag["domaine_recommande"]
+    if services:
+        lieu = f"à {location}" if location else ("près de vous" if ulat else "au Bénin")
+        lines.append(f"\nPrestataires en {domaine_rec} {lieu} :")
+        for i, s in enumerate(services[:3], 1):
+            e    = s.get("entreprise", {}) or {}
+            dist = s.get("distance_km")
+            dst  = f" ({dist:.1f} km)" if dist is not None else ""
+            lines.append(
+                f"{i}. {e.get('name', 'Inconnu')}{dst}\n"
+                f"   Tél : {e.get('call_phone') or '—'} | WA : {e.get('whatsapp_phone') or '—'}"
+            )
+    else:
+        lines.append(f"\nRecherchez un spécialiste en : {domaine_rec}")
+        lines.append("Utilisez CarEasy pour trouver le plus proche de vous.")
+
+    diag_data = {
+        "code":              diag_code,
+        "titre":             diag["titre"],
+        "urgence":           diag["urgence"],
+        "causes_probables":  diag["causes_probables"][:3],
+        "actions_immediates": diag["actions_immediates"][:3],
+        "domaine_recommande": domaine_rec,
+        "cout_estimatif":    diag["cout_estimatif"],
+        "delai_recommande":  diag["delai_recommande"],
+        "questions":         diag["diagnostic_rapide"][:3],
+    }
+
+    return "\n".join(lines), diag_data
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -347,7 +855,6 @@ KW2DOM: Dict[str, str] = {}
 for dom, kws in DOMAINES.items():
     for kw in kws:
         KW2DOM[normalize_text(kw)] = dom
-
 for dom in DOMAINES.keys():
     dom_n = normalize_text(dom)
     if dom_n not in KW2DOM:
@@ -373,7 +880,7 @@ STOP_LOC = {
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  FAQ
+#  FAQ COMPLÈTE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 FAQ: List[Dict] = [
@@ -460,7 +967,7 @@ FAQ: List[Dict] = [
     {
         "tags": ["abonnement", "plans", "tarifs", "prix careasy", "offres prestataire"],
         "content": (
-            "Plans CarEasy prestataire (section Plans & Abonnements dans Paramètres) :\n"
+            "Plans CarEasy prestataire (section Plans et Abonnements dans Paramètres) :\n"
             "- Essentiel : 25 000 FCFA/mois (5 services)\n"
             "- Professionnel : 50 000 FCFA/mois (15 services, statistiques, support prioritaire)\n"
             "- Premium : 100 000 FCFA/mois (illimité, SMS clients, API)\n"
@@ -473,7 +980,7 @@ FAQ: List[Dict] = [
         "content": (
             "L'essai gratuit de 30 jours démarre automatiquement après validation de votre entreprise. "
             "Il inclut 3 services maximum, la visibilité clients et la gestion des rendez-vous. "
-            "Suivez le décompte dans l'onglet Mes entreprises → badge bleu Essai gratuit. "
+            "Suivez le décompte dans l'onglet Mes entreprises — badge bleu Essai gratuit. "
             "Un plan payant est requis après les 30 jours pour continuer."
         )
     },
@@ -481,7 +988,7 @@ FAQ: List[Dict] = [
         "tags": ["payer", "paiement", "fedapay", "mobile money", "orange money", "mtn"],
         "content": (
             "Pour souscrire à un plan dans l'application CarEasy :\n"
-            "1) Allez dans Paramètres → Plans & Abonnements.\n"
+            "1) Allez dans Paramètres → Plans et Abonnements.\n"
             "2) Choisissez votre plan et appuyez sur Souscrire.\n"
             "3) Payez via FedaPay : Orange Money, MTN Money, Moov Money ou carte bancaire.\n"
             "Une facture est envoyée par email après paiement."
@@ -491,9 +998,9 @@ FAQ: List[Dict] = [
         "tags": ["support", "aide", "probleme", "bug", "contacter careasy"],
         "content": (
             "Support CarEasy :\n"
-            "- Dans l'application : Paramètres → Aide & support\n"
+            "- Dans l'application : Paramètres → Aide et support\n"
             "- Email : support@careasy.bj\n"
-            "- WhatsApp : disponible depuis la page À propos de l'app\n"
+            "- WhatsApp : disponible depuis la page A propos de l'app\n"
             "Disponible du lundi au vendredi de 8h à 18h."
         )
     },
@@ -511,7 +1018,7 @@ FAQ: List[Dict] = [
     {
         "tags": ["position gps", "geolocalisation", "localisation", "activer gps"],
         "content": (
-            "Pour activer la géolocalisation dans CarEasy :\n"
+            "Pour activer la géolocalisation dans CarEasy : "
             "L'application vous demande l'autorisation au premier lancement. "
             "Si vous l'avez refusée, allez dans les Paramètres de votre téléphone → Applications → CarEasy → Autorisations → Localisation. "
             "La géolocalisation affiche automatiquement les prestataires les plus proches de vous sur la carte."
@@ -534,13 +1041,13 @@ FAQ: List[Dict] = [
             "1) Onglet Profil (icône personne) dans la barre de navigation.\n"
             "2) Appuyez sur Modifier le profil pour changer nom, email ou téléphone.\n"
             "3) Pour la photo : icône appareil photo sur votre avatar → choisir Galerie ou Appareil photo.\n"
-            "4) Pour le mot de passe : Paramètres → Confidentialité & sécurité → Changer le mot de passe."
+            "4) Pour le mot de passe : Paramètres → Confidentialité et sécurité → Changer le mot de passe."
         )
     },
     {
         "tags": ["notifications", "alertes", "notification"],
         "content": (
-            "Pour gérer les notifications dans CarEasy :\n"
+            "Pour gérer les notifications dans CarEasy : "
             "Paramètres → Notifications. "
             "Vous pouvez activer/désactiver les notifications push, email et SMS, "
             "et choisir le son de notification."
@@ -549,7 +1056,7 @@ FAQ: List[Dict] = [
     {
         "tags": ["theme", "mode sombre", "apparence", "dark mode"],
         "content": (
-            "Pour changer le thème de l'application CarEasy :\n"
+            "Pour changer le thème de l'application CarEasy : "
             "Paramètres → Apparence → choisissez Clair, Sombre ou Système (suit votre téléphone)."
         )
     },
@@ -557,7 +1064,7 @@ FAQ: List[Dict] = [
         "tags": ["connexion qr", "qr code connexion", "scanner qr", "autre telephone"],
         "content": (
             "Pour vous connecter sur un autre téléphone via QR code :\n"
-            "1) Sur l'appareil déjà connecté : Paramètres → Confidentialité & sécurité → Appareils connectés → Ajouter via QR.\n"
+            "1) Sur l'appareil déjà connecté : Paramètres → Confidentialité et sécurité → Appareils connectés → Ajouter via QR.\n"
             "2) Sur le nouvel appareil : écran de bienvenue → Connexion rapide via QR code.\n"
             "3) Scannez le QR code — connexion automatique et sécurisée (valable 2 minutes)."
         )
@@ -565,7 +1072,7 @@ FAQ: List[Dict] = [
     {
         "tags": ["messages", "conversations", "tchat", "chat"],
         "content": (
-            "Pour accéder à vos messages dans CarEasy :\n"
+            "Pour accéder à vos messages dans CarEasy : "
             "Appuyez sur l'onglet Messages (icône bulle) dans la barre de navigation en bas. "
             "Vous y trouvez toutes vos conversations avec les prestataires. "
             "L'onglet affiche un badge rouge avec le nombre de messages non lus."
@@ -596,9 +1103,6 @@ def faq_lookup(text: str) -> Optional[str]:
 
 def detect_lang(text: str) -> str:
     t  = normalize_text(text)
-    for m in ["mɛ̌", "ɖò", "nɔ ", "blɔ́", "wè ", "alɔ", "aca"]:
-        if m in t:
-            return "fon"
     fr = sum(1 for w in [
         "je", "cherche", "besoin", "comment", "combien", "prix",
         "pour", "dans", "sur", "bonjour", "merci", "veux",
@@ -612,12 +1116,7 @@ def detect_lang(text: str) -> str:
 
 
 def extract_domaine(text: str) -> Optional[str]:
-    """
-    Extrait le domaine depuis le texte.
-    FIX: normalisation avec suppression des accents pour matcher les mots clés.
-    """
     t = normalize_text(text)
-    # Trier par longueur décroissante pour matcher les plus spécifiques en premier
     for kw in sorted(KW2DOM.keys(), key=len, reverse=True):
         if kw in t:
             return KW2DOM[kw]
@@ -660,11 +1159,9 @@ def _needs_db(intent: str, domaine: Optional[str], location: Optional[str],
         return True
     if ctx.get("last_domaine") or ctx.get("last_lat"):
         return True
-    if intent in {"urgence", "recherche"}:
+    if intent in {"urgence", "recherche", "diagnostic"}:
         return True
     if intent == "general" and wc >= 4:
-        return True
-    if intent == "faq" and ctx.get("last_services"):
         return True
     return False
 
@@ -686,12 +1183,16 @@ def intent_classify(text: str, ctx: Dict) -> str:
     if any(s in t for s in [
         "comment tu t'appelle", "qui es-tu", "c'est quoi careasy",
         "c'est quoi carai", "que peux-tu faire", "tu es qui", "presente-toi",
-        "qu'est-ce que careasy", "kesako careasy",
+        "qu'est-ce que careasy",
     ]):
         return "bot_info"
 
     if any(s in t for s in ["comment tu vas", "tu vas bien", "ca va"]) and wc <= 5:
         return "perso"
+
+    # Détecter un diagnostic AVANT le reste
+    if detect_diagnostic_intent(text):
+        return "diagnostic"
 
     FAQ_KW = [
         "comment creer", "comment modifier", "comment supprimer", "comment payer",
@@ -726,18 +1227,11 @@ def intent_classify(text: str, ctx: Dict) -> str:
             "adresse", "situe", "localisation", "prix", "combien",
             "horaire", "ouvre", "itineraire", "aller", "route"
         ]
-        IMPLICIT_WORDS = [
-            "et ", "eux", "elles", "ils", "leur", "leurs",
-            "y a", "actuellement", "en ce moment", "pour le moment",
-            "entreprise", "prestataire", "service"
-        ]
+        is_rank  = any(r in t for r in RANKS)
+        is_vague = any(v in t for v in VAGUE)
+        is_short = wc <= 7 and any(f in t for f in FKWS)
 
-        is_rank     = any(r in t for r in RANKS)
-        is_vague    = any(v in t for v in VAGUE)
-        is_short    = wc <= 7 and any(f in t for f in FKWS)
-        is_implicit = wc <= 8 and any(w in t for w in IMPLICIT_WORDS)
-
-        if is_rank or is_vague or is_short or is_implicit:
+        if is_rank or is_vague or is_short:
             if any(f in t for f in ["numero", "contact", "appeler", "whatsapp", "telephone"]):
                 return "followup_contact"
             if any(f in t for f in ["adresse", "situe", "localisation", "ou sont", "ou est"]):
@@ -779,10 +1273,7 @@ def resolve_ref(text: str, ctx: Dict) -> Optional[Dict]:
         if any(p in t for p in patterns):
             return svcs[rank - 1] if rank - 1 < len(svcs) else None
 
-    VAGUE = [
-        "celui-la", "cet endroit", "ce prestataire",
-        "cette entreprise", "la-bas", "ce garage"
-    ]
+    VAGUE = ["celui-la", "cet endroit", "ce prestataire", "cette entreprise", "la-bas", "ce garage"]
     if any(v in t for v in VAGUE):
         return svcs[0]
 
@@ -795,7 +1286,7 @@ def resolve_ref(text: str, ctx: Dict) -> Optional[Dict]:
                 if len(word) >= 4 and word in t:
                     return s
 
-    FKWS = ["numero", "contact", "appeler", "whatsapp", "telephone", "adresse", "prix", "horaire", "itineraire"]
+    FKWS = ["numero", "contact", "appeler", "whatsapp", "telephone", "adresse", "prix", "horaire"]
     if len(text.split()) <= 6 and any(f in t for f in FKWS):
         return svcs[0]
 
@@ -820,7 +1311,7 @@ def resolve_all(text: str, ctx: Dict) -> List[Dict]:
 async def mem_get(cid: str) -> Dict:
     if redis_client:
         try:
-            raw = await redis_client.get(f"carai9:{cid}")
+            raw = await redis_client.get(f"carai10:{cid}")
             if raw:
                 return json.loads(raw)
         except Exception:
@@ -835,7 +1326,7 @@ async def mem_save(cid: str, data: Dict):
     if redis_client:
         try:
             await redis_client.setex(
-                f"carai9:{cid}", 14400,
+                f"carai10:{cid}", 14400,
                 json.dumps(data, ensure_ascii=False, default=str)
             )
         except Exception:
@@ -882,7 +1373,7 @@ async def geocode(location: str) -> Optional[Tuple[float, float]]:
                         "q": f"{location}, Bénin",
                         "format": "json", "limit": 1, "countrycodes": "bj"
                     },
-                    headers={"User-Agent": "CarEasy-CarAI/9.3"},
+                    headers={"User-Agent": "CarEasy-CarAI/10.0"},
                 )
                 if r.status_code == 200 and r.json():
                     d = r.json()[0]
@@ -912,8 +1403,7 @@ async def geocode(location: str) -> Optional[Tuple[float, float]]:
 
 def haversine(lat1, lon1, lat2, lon2) -> float:
     R  = 6371
-    p1 = math.radians(lat1)
-    p2 = math.radians(lat2)
+    p1, p2 = math.radians(lat1), math.radians(lat2)
     a  = (
         math.sin(math.radians(lat2 - lat1) / 2) ** 2
         + math.cos(p1) * math.cos(p2)
@@ -938,7 +1428,7 @@ def dur(km: float) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  API LARAVEL — avec stratégie de fallback robuste
+#  API LARAVEL
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def api_nearby(
@@ -956,7 +1446,6 @@ async def api_nearby(
             if r.status_code == 200:
                 data = r.json().get("data", [])
                 _LEARN["stats"]["db_hits"] += 1
-                print(f"[DB] api_nearby({lat:.2f},{lng:.2f},{domaine!r},{radius}km) -> {len(data)} résultats")
                 normalized = [_normalize_service(s) for s in data]
                 return sorted(normalized, key=lambda x: x.get("distance_km") or 999)
     except Exception as e:
@@ -967,32 +1456,24 @@ async def api_nearby(
 
 def _normalize_service(s: Dict) -> Dict:
     e = s.get("entreprise", {}) or {}
-
     dom = s.get("domaine")
     if isinstance(dom, dict):
         dom = dom.get("name")
-
     s_copy = dict(s)
     s_copy["domaine"] = dom
-
     if isinstance(e, dict) and e.get("latitude") is not None:
         e_copy = dict(e)
         if not e_copy.get("address"):
             e_copy["address"] = e_copy.get("google_formatted_address")
         s_copy["entreprise"] = e_copy
         return s_copy
-
     s_copy["entreprise"] = {
-        "id":                       e.get("id"),
-        "name":                     e.get("name"),
-        "latitude":                 e.get("latitude"),
-        "longitude":                e.get("longitude"),
+        "id": e.get("id"), "name": e.get("name"),
+        "latitude": e.get("latitude"), "longitude": e.get("longitude"),
         "google_formatted_address": e.get("google_formatted_address") or e.get("address"),
-        "address":                  e.get("google_formatted_address") or e.get("address"),
-        "call_phone":               e.get("call_phone"),
-        "whatsapp_phone":           e.get("whatsapp_phone"),
-        "status_online":            e.get("status_online", True),
-        "logo":                     e.get("logo"),
+        "address": e.get("google_formatted_address") or e.get("address"),
+        "call_phone": e.get("call_phone"), "whatsapp_phone": e.get("whatsapp_phone"),
+        "status_online": e.get("status_online", True), "logo": e.get("logo"),
     }
     return s_copy
 
@@ -1007,7 +1488,6 @@ async def api_by_domaine(domaine: str, limit: int = 15) -> List[Dict]:
             if r.status_code == 200:
                 data = r.json().get("data", [])
                 _LEARN["stats"]["db_hits"] += 1
-                print(f"[DB] api_by_domaine({domaine!r}) -> {len(data)} résultats")
                 return [_normalize_service(s) for s in data]
     except Exception as e:
         print(f"[DB] api_by_domaine ERREUR: {e}")
@@ -1024,7 +1504,6 @@ async def api_services_all(domaine: Optional[str] = None, limit: int = 20) -> Li
             r = await c.get(f"{LARAVEL_BASE}/ai/services", params=params)
             if r.status_code == 200:
                 data = r.json().get("data", [])
-                print(f"[DB] api_services_all({domaine!r}) -> {len(data)} résultats")
                 return [_normalize_service(s) for s in data]
     except Exception as e:
         print(f"[DB] api_services_all ERREUR: {e}")
@@ -1044,23 +1523,15 @@ async def api_domaines() -> List[str]:
 
 def clean_svc(s: Dict) -> Dict:
     e = s.get("entreprise") or {}
-
     dist = s.get("distance_km")
     try:
         dist = round(float(dist), 1) if dist is not None else None
     except (TypeError, ValueError):
         dist = None
-
     domaine_val = s.get("domaine")
     if isinstance(domaine_val, dict):
         domaine_val = domaine_val.get("name")
-
-    address = (
-        e.get("google_formatted_address")
-        or e.get("address")
-        or None
-    )
-
+    address = e.get("google_formatted_address") or e.get("address") or None
     return {
         "id":                  s.get("id"),
         "name":                s.get("name"),
@@ -1076,15 +1547,11 @@ def clean_svc(s: Dict) -> Dict:
         "average_rating":      s.get("average_rating"),
         "total_reviews":       s.get("total_reviews"),
         "entreprise": {
-            "id":             e.get("id"),
-            "name":           e.get("name"),
-            "address":        address,
-            "latitude":       e.get("latitude"),
-            "longitude":      e.get("longitude"),
-            "call_phone":     e.get("call_phone"),
-            "whatsapp_phone": e.get("whatsapp_phone"),
-            "logo":           e.get("logo"),
-            "status_online":  e.get("status_online"),
+            "id": e.get("id"), "name": e.get("name"),
+            "address": address,
+            "latitude": e.get("latitude"), "longitude": e.get("longitude"),
+            "call_phone": e.get("call_phone"), "whatsapp_phone": e.get("whatsapp_phone"),
+            "logo": e.get("logo"), "status_online": e.get("status_online"),
         },
     }
 
@@ -1095,7 +1562,7 @@ def fmt_price(s: Dict) -> str:
     p, pp = s.get("price"), s.get("price_promo")
     try:
         if pp and s.get("has_promo") and p:
-            return f"{int(float(pp)):,} FCFA (promo — au lieu de {int(float(p)):,} FCFA)".replace(",", " ")
+            return f"{int(float(pp)):,} FCFA (promo)".replace(",", " ")
         if p:
             return f"{int(float(p)):,} FCFA".replace(",", " ")
     except (TypeError, ValueError):
@@ -1105,9 +1572,9 @@ def fmt_price(s: Dict) -> str:
 
 def fmt_hours(s: Dict) -> str:
     if s.get("is_always_open") or s.get("is_open_24h"):
-        return "ouvert 24h/24, 7j/7"
+        return "ouvert 24h/24"
     st, et = s.get("start_time"), s.get("end_time")
-    return f"{st} – {et}" if st and et else "horaires non renseignés"
+    return f"{st} - {et}" if st and et else "horaires non renseignés"
 
 
 def fmt_rating(s: Dict) -> str:
@@ -1119,8 +1586,7 @@ def fmt_rating(s: Dict) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  RECHERCHE ROBUSTE — FIX PRINCIPAL
-#  Stratégie en cascade garantissant toujours des résultats si la BDD en contient
+#  RECHERCHE ROBUSTE — 8 niveaux en cascade
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def search_services_robust(
@@ -1131,17 +1597,12 @@ async def search_services_robust(
     ctx: Dict,
     radius: float = 20,
 ) -> Tuple[List[Dict], bool]:
-    """
-    Retourne (services, found_with_domaine_filter).
-    Stratégie : on essaie plusieurs niveaux de filtrage jusqu'à trouver des résultats.
-    """
     services: List[Dict] = []
-    has_gps = (ulat is not None and ulng is not None)
-    ctx_lat = ctx.get("last_lat")
-    ctx_lng = ctx.get("last_lng")
+    has_gps    = (ulat is not None and ulng is not None)
+    ctx_lat    = ctx.get("last_lat")
+    ctx_lng    = ctx.get("last_lng")
     has_ctx_gps = (ctx_lat is not None and ctx_lng is not None)
 
-    # ── NIVEAU 1 : GPS en temps réel + domaine ────────────────────────────
     if has_gps:
         services = await api_nearby(ulat, ulng, domaine, radius, limit=10)
         if not services and radius < 50:
@@ -1151,7 +1612,6 @@ async def search_services_robust(
         if services:
             return services, True
 
-    # ── NIVEAU 2 : GPS contexte + domaine ────────────────────────────────
     if not services and has_ctx_gps and not location:
         services = await api_nearby(float(ctx_lat), float(ctx_lng), domaine, radius, limit=10)
         if not services:
@@ -1159,7 +1619,6 @@ async def search_services_robust(
         if services:
             return services, True
 
-    # ── NIVEAU 3 : Ville mentionnée + domaine ────────────────────────────
     if not services and location:
         coords = await geocode(location)
         if coords:
@@ -1169,26 +1628,21 @@ async def search_services_robust(
         if services:
             return services, True
 
-    # ── NIVEAU 4 : Domaine sans GPS ──────────────────────────────────────
     if not services and domaine:
         services = await api_by_domaine(domaine, limit=15)
         if services:
             return services, True
 
-    # ── NIVEAU 5 : GPS en temps réel SANS filtre domaine ─────────────────
-    # (le domaine n'est peut-être pas exact, mais il y a des services à proximité)
     if not services and has_gps:
         services = await api_nearby(ulat, ulng, None, 50, limit=10)
         if services:
-            return services, False  # trouvé mais sans filtre domaine
+            return services, False
 
-    # ── NIVEAU 6 : GPS contexte SANS filtre domaine ──────────────────────
     if not services and has_ctx_gps:
         services = await api_nearby(float(ctx_lat), float(ctx_lng), None, 50, limit=10)
         if services:
             return services, False
 
-    # ── NIVEAU 7 : Ville SANS filtre domaine ─────────────────────────────
     if not services and location:
         coords = await geocode(location)
         if coords:
@@ -1196,7 +1650,6 @@ async def search_services_robust(
         if services:
             return services, False
 
-    # ── NIVEAU 8 : Tous les services sans filtre ─────────────────────────
     if not services:
         services = await api_services_all(None, limit=15)
         if services:
@@ -1206,259 +1659,191 @@ async def search_services_robust(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  PROMPT SYSTÈME OLLAMA v9.3
+#  MOTEUR DE RÉPONSE AUTONOME — Templates riches, sans Ollama
 # ═══════════════════════════════════════════════════════════════════════════════
 
-SYS = """Tu es CarAI, l'assistant de l'APPLICATION MOBILE CarEasy Bénin.
+class ReplyEngine:
+    """
+    Génère des réponses naturelles et riches sans LLM externe.
+    Utilise des templates, des arbres de décision et la composition dynamique.
+    """
 
-CONTEXTE ABSOLU :
-CarEasy est une application mobile Flutter (Android & iOS) qui connecte conducteurs et prestataires automobiles au Bénin.
-Tu aides les utilisateurs à utiliser l'APPLICATION MOBILE CarEasy et à trouver des prestataires.
-Tu ne parles QUE de l'application CarEasy, de l'automobile et des services associés au Bénin.
-
-NAVIGATION DE L'APPLICATION :
-- Barre de navigation en bas : Accueil | Messages | Rendez-vous | Entreprise | Profil
-- Accueil : liste les services et entreprises, bouton Contacter et Détails
-- Messages : toutes les conversations avec les prestataires
-- Rendez-vous : gérer les RDV (En attente / Confirmé / Terminé / Annulé)
-- Entreprise : Mes entreprises, créer/gérer entreprise et services
-- Profil (Paramètres) : modifier profil, notifications, apparence, sécurité, plans, aide, à propos
-- CarAI : bouton flottant rouge en bas à droite de l'accueil
-
-STYLE DE RÉPONSE :
-- Phrases courtes et naturelles, ton chaleureux et direct comme un conseiller béninois.
-- Donne les vrais contacts, prix et horaires directement sans détour.
-- Pour les questions sur l'app, donne le chemin de navigation exact (ex: "Onglet Profil → Paramètres → Notifications")
-- JAMAIS de "localhost" → utilise {site_url}
-- JAMAIS d'emojis (l'app les gère)
-- Si tu ne sais pas, dis-le simplement.
-- Si les prestataires trouvés ne correspondent pas exactement au domaine demandé, dis-le clairement ET liste quand même les prestataires disponibles.
-
-RÈGLES ABSOLUES :
-1. Si des prestataires sont dans les DONNÉES CI-DESSOUS → liste-les TOUS avec contacts réels.
-2. Si aucun prestataire trouvé pour le domaine exact → propose les prestataires disponibles dans d'autres domaines en l'indiquant.
-3. Ne réponds qu'aux sujets : application CarEasy, automobile au Bénin, services auto.
-4. Pour les questions de suivi, utilise les prestataires déjà présentés dans CONTEXTE.
-5. Ne dis JAMAIS "je n'ai pas accès" si des données sont fournies ci-dessous.
-6. Tes réponses sont DÉFINITIVES — ne génère PAS d'introduction avant de lister, liste directement.
-
-CONTEXTE CONVERSATION :
-{ctx}
-
-DONNÉES BASE DE DONNÉES CAREASY (temps réel) :
-{db}
-
-INFORMATIONS PLATEFORME :
-{faq}"""
-
-
-def build_db_block(
-    services: List[Dict],
-    ref_svc:  Optional[Dict],
-    all_svcs: List[Dict],
-    found_exact: bool = True,
-    domaine_requested: Optional[str] = None,
-) -> str:
-    if ref_svc:
-        e    = ref_svc.get("entreprise", {}) or {}
-        note = fmt_rating(ref_svc)
-        addr = e.get("google_formatted_address") or e.get("address") or "non renseignée"
-        return (
-            f"Prestataire : {e.get('name', ref_svc.get('name', 'Inconnu'))}\n"
-            f"Service : {ref_svc.get('name', 'N/A')}\n"
-            f"Prix : {fmt_price(ref_svc)} | Horaires : {fmt_hours(ref_svc)}\n"
-            f"Telephone : {e.get('call_phone') or 'non renseigne'}\n"
-            f"WhatsApp : {e.get('whatsapp_phone') or 'non renseigne'}\n"
-            f"Adresse : {addr}"
-            + (f"\n{note}" if note else "")
-        )
-
-    if all_svcs:
-        lines = [f"{len(all_svcs)} prestataire(s) en mémoire :"]
-        for i, s in enumerate(all_svcs, 1):
-            e = s.get("entreprise", {}) or {}
-            lines.append(
-                f"{i}. {e.get('name', 'Inconnu')} "
-                f"| Tel: {e.get('call_phone') or '—'} "
-                f"| WA: {e.get('whatsapp_phone') or '—'}"
-            )
-        return "\n".join(lines)
-
-    if not services:
-        return "AUCUN prestataire trouvé dans la base de données CarEasy pour cette recherche."
-
-    note_exact = ""
-    if not found_exact and domaine_requested:
-        note_exact = (
-            f"NOTE : Aucun prestataire trouvé pour '{domaine_requested}' spécifiquement. "
-            f"Voici les prestataires disponibles sur CarEasy (autres domaines) :\n"
-        )
-
-    lines = [f"{note_exact}{len(services)} prestataire(s) trouvé(s) dans la base de données CarEasy :"]
-    for i, s in enumerate(services, 1):
-        e    = s.get("entreprise", {}) or {}
-        dist = s.get("distance_km")
-        dst  = f" | {dist:.1f} km" if dist is not None else ""
-        note = fmt_rating(s)
-        addr = e.get("google_formatted_address") or e.get("address") or "adresse non renseignée"
-        dom_s = s.get("domaine") or ""
-        lines.append(
-            f"{i}. {e.get('name', 'Inconnu')} — {s.get('name', 'N/A')} [{dom_s}]{dst}"
-            + (f" | {note}" if note else "") + "\n"
-            f"   Prix: {fmt_price(s)} | Horaires: {fmt_hours(s)}\n"
-            f"   Tel: {e.get('call_phone') or '—'} | WA: {e.get('whatsapp_phone') or '—'}\n"
-            f"   Adresse: {addr}"
-        )
-    return "\n".join(lines)
-
-
-def build_ctx_block(ctx: Dict, history: List[Dict]) -> str:
-    parts = []
-    if ctx.get("last_domaine"):
-        parts.append(f"Service recherché : {ctx['last_domaine']}")
-    if ctx.get("last_location"):
-        parts.append(f"Localisation : {ctx['last_location']}")
-    if ctx.get("last_services"):
-        noms = [
-            (s.get("entreprise") or {}).get("name") or s.get("name") or "Inconnu"
-            for s in ctx["last_services"][:4]
+    @staticmethod
+    def salutation(lang: str) -> str:
+        fr = [
+            "Bonjour ! Je suis CarAI, votre assistant CarEasy Bénin. Que puis-je faire pour vous ?",
+            "Bonjour ! Comment puis-je vous aider aujourd'hui ?",
+            "Bonsoir ! Dites-moi ce que vous recherchez — garage, dépannage, vulcanisateur...",
+            "Salut ! CarAI à votre service. Quelle est votre recherche ?",
         ]
-        parts.append(f"Prestataires déjà présentés : {', '.join(noms)}")
-    for turn in history[-4:]:
-        role = "Client" if turn.get("role") == "user" else "CarAI"
-        parts.append(f"{role}: {turn.get('content', '')[:150]}")
-    return "\n".join(parts) if parts else "Début de conversation"
+        en = [
+            "Hello! I'm CarAI, your CarEasy Benin assistant. How can I help you?",
+            "Hi there! Looking for a mechanic, fuel station or roadside help?",
+        ]
+        return random.choice(en if lang == "en" else fr)
 
+    @staticmethod
+    def remerciement(lang: str) -> str:
+        fr = ["Avec plaisir !", "De rien, bonne route !", "Je suis là pour ça !", "Toujours disponible pour vous !"]
+        en = ["You're welcome!", "Happy to help!", "Glad I could assist!"]
+        return random.choice(en if lang == "en" else fr)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  OLLAMA
-# ═══════════════════════════════════════════════════════════════════════════════
+    @staticmethod
+    def aurevoir(lang: str) -> str:
+        fr = ["À bientôt ! Bonne route.", "Au revoir ! Conduisez prudemment.", "À la prochaine !"]
+        en = ["Goodbye! Drive safe.", "See you soon!", "Take care!"]
+        return random.choice(en if lang == "en" else fr)
 
-async def ask_ollama(
-    user_msg: str,
-    ctx:      Dict,
-    history:  List[Dict],
-    services: List[Dict],
-    ref_svc:  Optional[Dict],
-    all_svcs: List[Dict],
-    faq_hint: Optional[str] = None,
-    found_exact: bool = True,
-    domaine_requested: Optional[str] = None,
-) -> Optional[str]:
-    if not USE_OLLAMA:
-        return None
+    @staticmethod
+    def bot_info(lang: str) -> str:
+        return (
+            f"Je suis CarAI v{APP_VERSION}, l'assistant intelligent de l'application mobile CarEasy Bénin.\n\n"
+            f"Je peux vous aider avec :\n"
+            f"- Trouver des prestataires automobiles (garage, vulcanisateur, station, etc.)\n"
+            f"- Diagnostiquer une panne ou anomalie sur votre vehicule\n"
+            f"- Utiliser l'application CarEasy (compte, rendez-vous, paiement...)\n\n"
+            f"Je fonctionne 24h/24 et j'ai accès en temps réel à la base de données CarEasy.\n"
+            f"Site web : {SITE_URL}"
+        ) if lang != "en" else (
+            f"I'm CarAI v{APP_VERSION}, the intelligent assistant of the CarEasy Benin mobile app.\n"
+            f"I can help you find auto service providers, diagnose car issues, and use the CarEasy app.\n"
+            f"Website: {SITE_URL}"
+        )
 
-    system = SYS.format(
-        site_url=SITE_URL,
-        ctx=build_ctx_block(ctx, history),
-        db=build_db_block(services, ref_svc, all_svcs, found_exact, domaine_requested),
-        faq=faq_hint or "Pas d'information spécifique sur la plateforme.",
-    )
-
-    msgs = [{"role": "system", "content": system}]
-    for turn in history[-4:]:
-        role    = turn.get("role", "user")
-        content = turn.get("content", "")
-        if content and role in ("user", "assistant"):
-            msgs.append({"role": role, "content": content[:250]})
-    msgs.append({"role": "user", "content": user_msg})
-
-    try:
-        async with httpx.AsyncClient(timeout=55) as c:
-            r = await c.post(
-                f"{OLLAMA_URL}/api/chat",
-                json={
-                    "model": OLLAMA_MODEL,
-                    "messages": msgs,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.75,
-                        "num_predict": 500,
-                        "num_ctx":     4096,
-                        "repeat_penalty": 1.1,
-                        "top_k": 40,
-                        "top_p": 0.92,
-                    },
-                },
-            )
-            if r.status_code == 200:
-                reply = r.json().get("message", {}).get("content", "").strip()
-                reply = re.sub(r"^(assistant\s*:\s*|carai\s*:\s*)", "", reply, flags=re.IGNORECASE)
-                reply = re.sub(r"http://localhost[^\s]*", SITE_URL, reply)
-                reply = re.sub(r"localhost:\d+", SITE_URL, reply)
-                if reply and len(reply) > 10:
-                    _LEARN["stats"]["ollama_ok"] += 1
-                    return reply
-    except Exception as e:
-        print(f"[Ollama] {type(e).__name__}: {e}")
-
-    return None
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  FALLBACK RÈGLES — FIX PRINCIPAL : réponse informative même sans match exact
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def fallback(
-    intent:   str,
-    msg:      str,
-    services: List[Dict],
-    ref_svc:  Optional[Dict],
-    all_svcs: List[Dict],
-    domaine:  Optional[str],
-    location: Optional[str],
-    ctx:      Dict,
-    lang:     str,
-    ulat:     Optional[float] = None,
-    ulng:     Optional[float] = None,
-    found_exact: bool = True,
-) -> str:
-    _LEARN["stats"]["fallback"] += 1
-
-    if intent == "salutation":
+    @staticmethod
+    def perso() -> str:
         return random.choice([
-            "Bonjour ! Que puis-je faire pour vous aujourd'hui ?",
-            "Bonjour ! Je suis CarAI, votre assistant CarEasy. Comment puis-je vous aider ?",
-            "Bonsoir ! Dites-moi ce que vous recherchez.",
+            "Je fonctionne parfaitement, merci ! Dites-moi comment je peux vous aider.",
+            "Toujours opérationnel ! En quoi puis-je vous être utile ?",
+            "Très bien ! Que puis-je faire pour vous aujourd'hui ?",
         ])
 
-    if intent == "remerciement":
-        return random.choice(["Avec plaisir !", "De rien, bonne route !", "Je suis là pour ça !"])
-
-    if intent == "aurevoir":
-        return random.choice(["À bientôt ! Bonne route.", "Au revoir !"])
-
-    if intent == "bot_info":
-        return (
-            f"Je suis CarAI, l'assistant de l'application mobile CarEasy Bénin. "
-            f"Je vous aide à trouver des prestataires automobiles partout au Bénin "
-            f"et à utiliser l'application CarEasy. Site : {SITE_URL}"
-        )
-
-    if intent == "perso":
-        return "Je vais bien, merci ! Dites-moi comment je peux vous aider."
-
-    if intent == "faq":
+    @staticmethod
+    def faq_response(msg: str) -> str:
         ans = faq_lookup(msg)
         if ans:
-            return ans.replace("{site}", SITE_URL)
+            return ans
         return (
-            f"Pour cette question sur l'application CarEasy, consultez {SITE_URL} "
-            "ou écrivez à support@careasy.bj. L'équipe répond en général dans la journée."
+            f"Je n'ai pas trouvé de réponse précise pour votre question sur l'application CarEasy.\n\n"
+            f"Contactez le support :\n"
+            f"- Email : support@careasy.bj\n"
+            f"- Dans l'app : Paramètres → Aide et support\n"
+            f"- Site web : {SITE_URL}\n\n"
+            f"L'équipe répond généralement dans la journée (lundi-vendredi 8h-18h)."
         )
 
-    # Suivi — tous les prestataires
-    if all_svcs and "followup" in intent:
-        lines = ["Voici les contacts des prestataires listés :"]
-        for i, s in enumerate(all_svcs, 1):
-            e  = s.get("entreprise", {}) or {}
-            ph = e.get("call_phone") or "—"
-            wa = e.get("whatsapp_phone") or "—"
-            lines.append(f"{i}. {e.get('name', 'Inconnu')} — Tél : {ph}  |  WA : {wa}")
+    @staticmethod
+    def urgence(services: List[Dict], domaine: Optional[str], ulat: Optional[float], ulng: Optional[float]) -> str:
+        lines = ["Situation d'urgence détectée — je cherche de l'aide immédiate.\n"]
+        if services:
+            e0  = (services[0].get("entreprise") or {})
+            ph  = e0.get("call_phone") or e0.get("whatsapp_phone")
+            nom = e0.get("name", "Prestataire")
+            dist = services[0].get("distance_km")
+            dst  = f" — à {dist:.1f} km de vous" if dist else ""
+            lines.append(f"Prestataire le plus proche{dst} :")
+            lines.append(f"{nom}")
+            if e0.get("call_phone"):
+                lines.append(f"Tel : {e0['call_phone']}")
+            if e0.get("whatsapp_phone"):
+                lines.append(f"WhatsApp : {e0['whatsapp_phone']}")
+            if ulat and ulng and e0.get("latitude") and e0.get("longitude"):
+                try:
+                    d_km = haversine(ulat, ulng, float(e0["latitude"]), float(e0["longitude"]))
+                    url  = map_link(ulat, ulng, float(e0["latitude"]), float(e0["longitude"]))
+                    lines.append(f"Itineraire : {url} ({d_km:.1f} km ~ {dur(d_km)})")
+                except Exception:
+                    pass
+            lines.append("")
+            if len(services) > 1:
+                lines.append("Autres options disponibles :")
+                for s in services[1:3]:
+                    e = s.get("entreprise") or {}
+                    lines.append(f"- {e.get('name', 'Inconnu')} | Tel : {e.get('call_phone') or '—'}")
+        else:
+            lines.append("Appelez le 166 (Gendarmerie) ou le 197 (Police) pour assistance.")
+            lines.append(f"Cherchez un prestataire sur {SITE_URL}")
         return "\n".join(lines)
 
-    # Suivi — un prestataire précis
-    if ref_svc and "followup" in intent:
+    @staticmethod
+    def services_found(
+        services: List[Dict],
+        domaine: Optional[str],
+        location: Optional[str],
+        ulat: Optional[float],
+        ulng: Optional[float],
+        found_exact: bool,
+    ) -> str:
+        if not services:
+            return (
+                f"Aucun prestataire n'est encore inscrit sur CarEasy pour ce service au Bénin.\n"
+                f"De nouveaux prestataires rejoignent CarEasy chaque semaine.\n\n"
+                f"Vous êtes prestataire ? Inscrivez-vous sur l'application CarEasy — "
+                f"essai gratuit de 30 jours !"
+            )
+
+        lieu = f"à {location}" if location else ("près de vous" if ulat else "au Bénin")
+
+        lines = []
+
+        if not found_exact and domaine:
+            domaines_dispo = list(dict.fromkeys(s.get("domaine") or "Autre" for s in services))
+            lines.append(
+                f"Pas encore de prestataire en {domaine} {lieu} sur CarEasy. "
+                f"Voici ce qui est disponible"
+                + (f" {lieu} :" if lieu != "au Bénin" else " au Bénin :")
+            )
+            for i, s in enumerate(services[:5], 1):
+                e    = s.get("entreprise", {}) or {}
+                dist = s.get("distance_km")
+                dst  = f" ({dist:.1f} km)" if dist is not None else ""
+                dom_s = s.get("domaine") or ""
+                note  = fmt_rating(s)
+                lines.append(
+                    f"\n{i}. {e.get('name', 'Inconnu')}{dst} — {dom_s}"
+                    + (f" | {note}" if note else "") + "\n"
+                    f"   {s.get('name', '')} | {fmt_hours(s)} | {fmt_price(s)}\n"
+                    f"   Tel : {e.get('call_phone') or '—'}   WA : {e.get('whatsapp_phone') or '—'}"
+                )
+            if len(services) > 5:
+                lines.append(f"\n... et {len(services) - 5} autre(s) disponible(s) dans l'app.")
+            lines.append(f"\nVous êtes prestataire en {domaine} ? Rejoignez CarEasy — essai gratuit 30 jours !")
+        else:
+            lines.append(f"J'ai trouvé {len(services)} prestataire(s) en {domaine or 'automobile'} {lieu} :")
+            for i, s in enumerate(services[:5], 1):
+                e    = s.get("entreprise", {}) or {}
+                dist = s.get("distance_km")
+                dst  = f" ({dist:.1f} km)" if dist is not None else ""
+                note  = fmt_rating(s)
+                lines.append(
+                    f"\n{i}. {e.get('name', 'Inconnu')}{dst}"
+                    + (f" — {note}" if note else "") + "\n"
+                    f"   {s.get('name', '')} | {fmt_hours(s)} | {fmt_price(s)}\n"
+                    f"   Tel : {e.get('call_phone') or '—'}   WA : {e.get('whatsapp_phone') or '—'}"
+                )
+            if len(services) > 5:
+                lines.append(f"\n... et {len(services) - 5} autre(s) dans l'application CarEasy.")
+
+        lines.append("\nVoulez-vous l'itinéraire ou les contacts d'un prestataire en particulier ?")
+        return "\n".join(lines)
+
+    @staticmethod
+    def followup(
+        intent: str, ref_svc: Optional[Dict], all_svcs: List[Dict],
+        ulat: Optional[float], ulng: Optional[float]
+    ) -> str:
+        if all_svcs:
+            lines = ["Contacts de tous les prestataires :"]
+            for i, s in enumerate(all_svcs, 1):
+                e  = s.get("entreprise", {}) or {}
+                ph = e.get("call_phone") or "—"
+                wa = e.get("whatsapp_phone") or "—"
+                lines.append(f"{i}. {e.get('name', 'Inconnu')} — Tel : {ph}  |  WA : {wa}")
+            return "\n".join(lines)
+
+        if not ref_svc:
+            return "Quel prestataire vous intéresse ? Indiquez le numéro (1, 2, 3...) ou le nom."
+
         e   = ref_svc.get("entreprise", {}) or {}
         ent = e.get("name", "Ce prestataire")
         svc = ref_svc.get("name", "ce service")
@@ -1468,9 +1853,9 @@ def fallback(
             ph = e.get("call_phone") or ""
             wa = e.get("whatsapp_phone") or ""
             if not ph and not wa:
-                return f"Aucun contact renseigné pour {ent} pour le moment."
+                return f"Aucun contact n'est renseigné pour {ent} pour le moment."
             parts = []
-            if ph: parts.append(f"Tél : {ph}")
+            if ph: parts.append(f"Tel : {ph}")
             if wa: parts.append(f"WhatsApp : {wa}")
             return f"{ent} — {' | '.join(parts)}"
 
@@ -1480,9 +1865,9 @@ def fallback(
                     d   = haversine(ulat, ulng, float(e["latitude"]), float(e["longitude"]))
                     url = map_link(ulat, ulng, float(e["latitude"]), float(e["longitude"]))
                     return (
-                        f"{ent} — {addr}. "
-                        f"Distance : {d:.1f} km (environ {dur(d)}). "
-                        f"Itinéraire : {url}"
+                        f"{ent} — {addr}\n"
+                        f"Distance : {d:.1f} km (environ {dur(d)})\n"
+                        f"Itineraire : {url}"
                     )
                 except Exception:
                     pass
@@ -1496,97 +1881,145 @@ def fallback(
 
         ph   = e.get("call_phone") or "—"
         wa   = e.get("whatsapp_phone") or "—"
-        return f"{ent} ({svc})\nTél : {ph}  |  WhatsApp : {wa}\nAdresse : {addr}"
-
-    # ── RÉSULTATS DE RECHERCHE — FIX CRITIQUE ────────────────────────────
-    lieu = f"à {location}" if location else ("près de vous" if ulat else "au Bénin")
-
-    if not services:
-        # Vraiment aucun service dans la BDD
+        note = fmt_rating(ref_svc)
         return (
-            f"Aucun prestataire n'est encore inscrit sur CarEasy pour ce service au Bénin. "
-            f"De nouveaux prestataires rejoignent CarEasy chaque semaine. "
-            f"Vous êtes prestataire ? Inscrivez-vous sur l'application CarEasy — "
-            f"essai gratuit de 30 jours !"
+            f"{ent} ({svc})\n"
+            f"Tel : {ph}  |  WhatsApp : {wa}\n"
+            f"Adresse : {addr}\n"
+            f"Horaires : {fmt_hours(ref_svc)}\n"
+            f"Prix : {fmt_price(ref_svc)}"
+            + (f"\n{note}" if note else "")
         )
 
-    # Services trouvés — construire une réponse riche
-    if not found_exact and domaine:
-        # Le domaine demandé n'est pas dans la BDD, mais on a d'autres services
-        # Grouper par domaine disponible
-        domaines_dispo = list(dict.fromkeys(
-            s.get("domaine") or "Autre"
-            for s in services
-        ))
+    @staticmethod
+    def general(msg: str, ctx: Dict, lang: str) -> str:
+        t = normalize_text(msg)
 
-        intro = (
-            f"Je n'ai pas encore de prestataire en {domaine} {lieu} sur CarEasy. "
-            f"Voici ce qui est disponible"
-            + (f" {lieu}" if lieu != "au Bénin" else " au Bénin") + " :\n"
-        )
-        lines = [intro]
-        for i, s in enumerate(services[:5], 1):
-            e    = s.get("entreprise", {}) or {}
-            dist = s.get("distance_km")
-            dst  = f" ({dist:.1f} km)" if dist is not None else ""
-            dom_s = s.get("domaine") or ""
-            note = fmt_rating(s)
-            lines.append(
-                f"{i}. {e.get('name', 'Inconnu')}{dst} — {dom_s}"
-                + (f" | {note}" if note else "") + "\n"
-                f"   {s.get('name', '')} | {fmt_hours(s)} | {fmt_price(s)}\n"
-                f"   Tél : {e.get('call_phone') or '—'}   WA : {e.get('whatsapp_phone') or '—'}"
+        if any(w in t for w in ["combien", "prix", "tarif", "cout"]):
+            dom = ctx.get("last_domaine")
+            if dom:
+                return (
+                    f"Le prix pour {dom} varie selon le prestataire et le type d'intervention.\n"
+                    f"Utilisez CarEasy pour comparer les tarifs en temps réel et réserver directement.\n"
+                    f"Les prestataires indiquent leurs prix et promotions dans l'application."
+                )
+
+        if any(w in t for w in ["meilleur", "recommande", "conseil", "top"]):
+            return (
+                f"Pour trouver le meilleur prestataire automobile près de vous :\n"
+                f"1) Ouvrez CarEasy et activez la géolocalisation\n"
+                f"2) Filtrez par domaine (garage, vulcanisateur, lavage...)\n"
+                f"3) Consultez les avis et notes des clients\n"
+                f"4) Contactez directement ou prenez rendez-vous\n\n"
+                f"Dites-moi votre ville ou activez votre GPS pour voir les options autour de vous."
             )
 
-        if len(services) > 5:
-            lines.append(f"\n...et {len(services) - 5} autre(s) disponible(s).")
-
-        lines.append(
-            f"\nVous êtes prestataire en {domaine} ? Rejoignez CarEasy — essai gratuit 30 jours !"
+        return (
+            f"Je suis CarAI, assistant CarEasy Bénin.\n\n"
+            f"Dites-moi ce que vous cherchez :\n"
+            f"- Un type de service auto (garage, vulcanisateur, lavage...)\n"
+            f"- Un diagnostic de panne\n"
+            f"- De l'aide pour utiliser l'application CarEasy\n\n"
+            f"Exemple : 'garage mecanique à Cotonou' ou 'mon moteur chauffe'"
         )
-        lines.append("Voulez-vous plus d'infos sur l'un de ces prestataires ?")
-        return "\n".join(lines)
 
-    # Résultats avec match exact sur le domaine
-    lines = [f"J'ai trouvé {len(services)} prestataire(s) en {domaine or 'automobile'} {lieu} :"]
-    for i, s in enumerate(services[:5], 1):
-        e    = s.get("entreprise", {}) or {}
-        dist = s.get("distance_km")
-        dst  = f" ({dist:.1f} km)" if dist is not None else ""
-        note = fmt_rating(s)
-        lines.append(
-            f"\n{i}. {e.get('name', 'Inconnu')}{dst}"
-            + (f" — {note}" if note else "") + "\n"
-            f"   {s.get('name', '')} | {fmt_hours(s)} | {fmt_price(s)}\n"
-            f"   Tél : {e.get('call_phone') or '—'}   WA : {e.get('whatsapp_phone') or '—'}"
-        )
-    if len(services) > 5:
-        lines.append(f"\n...et {len(services) - 5} autre(s) disponible(s).")
-    lines.append("\nVoulez-vous l'itinéraire ou les contacts d'un prestataire en particulier ?")
-    return "\n".join(lines)
 
+def generate_reply(
+    intent:      str,
+    msg:         str,
+    services:    List[Dict],
+    ref_svc:     Optional[Dict],
+    all_svcs:    List[Dict],
+    domaine:     Optional[str],
+    location:    Optional[str],
+    ctx:         Dict,
+    lang:        str,
+    ulat:        Optional[float] = None,
+    ulng:        Optional[float] = None,
+    found_exact: bool = True,
+    diag_code:   Optional[str] = None,
+) -> Tuple[str, Optional[Dict]]:
+    """
+    Génère une réponse complète. Retourne (reply_text, diagnostic_data_or_None).
+    """
+    _LEARN["stats"]["fallback"] += 1
+
+    # ── DIAGNOSTIC ──────────────────────────────────────────────────────────
+    if intent == "diagnostic" and diag_code:
+        diag_services = services  # services déjà filtrés sur le domaine recommandé
+        reply, diag_data = build_diagnostic_response(diag_code, diag_services, location, ulat)
+        return reply, diag_data
+
+    # ── SALUTATIONS ET META ─────────────────────────────────────────────────
+    if intent == "salutation":
+        return ReplyEngine.salutation(lang), None
+    if intent == "remerciement":
+        return ReplyEngine.remerciement(lang), None
+    if intent == "aurevoir":
+        return ReplyEngine.aurevoir(lang), None
+    if intent == "bot_info":
+        return ReplyEngine.bot_info(lang), None
+    if intent == "perso":
+        return ReplyEngine.perso(), None
+
+    # ── FAQ ──────────────────────────────────────────────────────────────────
+    if intent == "faq":
+        return ReplyEngine.faq_response(msg), None
+
+    # ── SUIVI ────────────────────────────────────────────────────────────────
+    if "followup" in intent:
+        return ReplyEngine.followup(intent, ref_svc, all_svcs, ulat, ulng), None
+
+    # ── URGENCE ──────────────────────────────────────────────────────────────
+    if intent == "urgence":
+        return ReplyEngine.urgence(services, domaine, ulat, ulng), None
+
+    # ── RECHERCHE ────────────────────────────────────────────────────────────
+    if intent in {"recherche", "general"}:
+        return ReplyEngine.services_found(services, domaine, location, ulat, ulng, found_exact), None
+
+    # ── GÉNÉRAL ──────────────────────────────────────────────────────────────
+    return ReplyEngine.general(msg, ctx, lang), None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SUGGESTIONS CONTEXTUELLES
+# ═══════════════════════════════════════════════════════════════════════════════
 
 SUGG_BASE = [
-    "Trouver un garage mécanique",
+    "Trouver un garage mecanique",
     "Vulcanisateur disponible",
     "Lavage auto",
-    "Électricien auto",
-    "Dépannage routier",
+    "Electricien auto",
+    "Depannage routier",
+]
+
+SUGG_DIAG = [
+    "Mon moteur chauffe",
+    "Voyant rouge allume",
+    "Ma voiture ne demarre pas",
+    "Bruit de freinage",
+    "Clim ne refroidit pas",
 ]
 
 
-def suggestions(domaine: Optional[str], location: Optional[str], ctx: Dict) -> List[str]:
+def suggestions(domaine: Optional[str], location: Optional[str], ctx: Dict, intent: str) -> List[str]:
     result = []
     if ctx.get("last_services"):
-        result += ["Contacts de tous", "Itinéraire vers le plus proche"]
+        result += ["Contacts de tous", "Itineraire vers le plus proche"]
     if domaine and location:
-        result.append(f"{domaine} à {location}")
+        result.append(f"{domaine} a {location}")
     elif domaine:
-        result.append(f"{domaine} à Cotonou")
-        result.append(f"{domaine} à Abomey-Calavi")
+        result.append(f"{domaine} a Cotonou")
+        result.append(f"{domaine} a Abomey-Calavi")
     if location:
-        result.append(f"Tous les services à {location}")
-    result += SUGG_BASE
+        result.append(f"Tous les services a {location}")
+
+    if intent == "diagnostic":
+        result += SUGG_DIAG[:3]
+    else:
+        result += SUGG_BASE
+
     seen, final = set(), []
     for s in result:
         if s not in seen:
@@ -1596,7 +2029,7 @@ def suggestions(domaine: Optional[str], location: Optional[str], ctx: Dict) -> L
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  ENDPOINT PRINCIPAL — v9.3
+#  ENDPOINT PRINCIPAL — v10.0
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/chat", response_model=ChatResponse)
@@ -1614,20 +2047,25 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
     radius   = extract_radius(req.message)
     wc       = len(req.message.split())
 
+    # Identifier le code de diagnostic si intent == diagnostic
+    diag_code: Optional[str] = None
+    if intent == "diagnostic":
+        diag_code = detect_diagnostic_intent(req.message)
+        # Si on a un diagnostic, on cherche des prestataires dans le bon domaine
+        if diag_code and DIAG_SYMPTOMS.get(diag_code):
+            domaine = DIAG_SYMPTOMS[diag_code]["domaine_recommande"]
+
     FOLLOW_INTENTS = {
         "followup_contact", "followup_adresse", "followup_prix",
         "followup_horaires", "followup_itineraire", "followup_info", "urgence",
     }
 
-    # Hériter du domaine du contexte si pas détecté
+    # Héritage du contexte
     if not domaine and ctx.get("last_domaine") and (
-        intent in FOLLOW_INTENTS
-        or ctx.get("last_services")
-        or wc <= 5
+        intent in FOLLOW_INTENTS or ctx.get("last_services") or wc <= 5
     ):
         domaine = ctx.get("last_domaine")
 
-    # Hériter de la localisation du contexte
     if not location and ctx.get("last_location") and intent in {
         "followup_adresse", "followup_itineraire", "recherche"
     }:
@@ -1645,7 +2083,6 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
     should_query_db = _needs_db(intent, domaine, location, ctx, wc)
 
     if should_query_db and not is_followup:
-        # Utiliser la stratégie de recherche robuste en cascade
         services, found_exact = await search_services_robust(
             domaine=domaine,
             location=location,
@@ -1655,23 +2092,19 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
             radius=radius,
         )
 
-        # Mise à jour GPS en contexte si fourni maintenant
         if req.latitude:
             ctx["last_lat"] = req.latitude
         if req.longitude:
             ctx["last_lng"] = req.longitude
 
-        # Générer l'itinéraire vers le premier résultat si GPS disponible
         if services and (req.latitude or ctx.get("last_lat")):
             use_lat = req.latitude or float(ctx.get("last_lat", 0))
             use_lng = req.longitude or float(ctx.get("last_lng", 0))
             e0 = (services[0].get("entreprise") or {})
             if e0.get("latitude") and e0.get("longitude"):
                 try:
-                    d_km  = haversine(use_lat, use_lng,
-                                      float(e0["latitude"]), float(e0["longitude"]))
-                    mapurl = map_link(use_lat, use_lng,
-                                      float(e0["latitude"]), float(e0["longitude"]))
+                    d_km  = haversine(use_lat, use_lng, float(e0["latitude"]), float(e0["longitude"]))
+                    mapurl = map_link(use_lat, use_lng, float(e0["latitude"]), float(e0["longitude"]))
                     itinerary = {
                         "maps_url":    mapurl,
                         "distance":    f"{d_km:.1f} km",
@@ -1685,41 +2118,23 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
 
     active = services or (ctx.get("last_services", []) if is_followup else [])
 
-    faq_hint = None
-    if intent in {"faq", "general", "bot_info"}:
-        faq_hint = faq_lookup(req.message)
-
-    # Ollama SEUL si disponible, fallback UNIQUEMENT sinon
-    reply = await ask_ollama(
-        user_msg=req.message,
-        ctx=ctx,
-        history=history,
+    reply, diag_data = generate_reply(
+        intent=intent,
+        msg=req.message,
         services=active,
         ref_svc=ref_svc,
         all_svcs=all_svcs,
-        faq_hint=faq_hint,
+        domaine=domaine,
+        location=location,
+        ctx=ctx,
+        lang=lang,
+        ulat=req.latitude,
+        ulng=req.longitude,
         found_exact=found_exact,
-        domaine_requested=domaine,
+        diag_code=diag_code,
     )
 
-    # Fallback activé UNIQUEMENT si Ollama retourne None
-    if not reply:
-        reply = fallback(
-            intent=intent,
-            msg=req.message,
-            services=active,
-            ref_svc=ref_svc,
-            all_svcs=all_svcs,
-            domaine=domaine,
-            location=location,
-            ctx=ctx,
-            lang=lang,
-            ulat=req.latitude,
-            ulng=req.longitude,
-            found_exact=found_exact,
-        )
-
-    # Nettoyage final — aucun lien localhost dans la réponse
+    # Nettoyage final
     reply = re.sub(r"http://localhost[^\s]*", SITE_URL, reply)
     reply = re.sub(r"localhost:\d+", SITE_URL, reply)
 
@@ -1728,6 +2143,7 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
     history.append({
         "role": "user", "content": req.message,
         "intent": intent, "domaine": domaine, "location": location,
+        "diag_code": diag_code,
         "ts": datetime.now().isoformat(),
     })
     history.append({
@@ -1741,6 +2157,7 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
     if req.latitude:   ctx["last_lat"]       = req.latitude
     if req.longitude:  ctx["last_lng"]       = req.longitude
     if cleaned:        ctx["last_services"]  = cleaned
+    if diag_code:      ctx["last_diag"]      = diag_code
 
     mem["history"] = history
     mem["ctx"]     = ctx
@@ -1750,9 +2167,8 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
     print(
         f"[CHAT] {req.conversation_id[:12]} | intent={intent} | "
         f"domaine={domaine or '-'} | loc={location or '-'} | "
-        f"services={len(active)} | exact={found_exact} | "
-        f"db={'oui' if should_query_db else 'non'} | "
-        f"{elapsed:.2f}s"
+        f"diag={diag_code or '-'} | services={len(active)} | "
+        f"exact={found_exact} | {elapsed:.2f}s"
     )
 
     return ChatResponse(
@@ -1762,10 +2178,98 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
         itinerary=itinerary,
         intent=domaine or intent,
         language=lang,
-        suggestions=suggestions(domaine, location, ctx),
+        suggestions=suggestions(domaine, location, ctx, intent),
         confidence=_confidence(req.message, intent),
+        diagnostic=diag_data,
     )
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ENDPOINT DIAGNOSTIC DÉDIÉ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/diagnostic")
+async def diagnostic_endpoint(req: DiagRequest):
+    """
+    Endpoint dédié pour un diagnostic approfondi à partir d'une liste de symptômes.
+    Idéal pour une intégration dans un formulaire de l'app Flutter.
+    """
+    if not req.symptoms:
+        raise HTTPException(400, "Au moins un symptôme requis")
+
+    # Rechercher le meilleur code de diagnostic
+    combined = " ".join(req.symptoms)
+    diag_code = detect_diagnostic_intent(combined)
+
+    if not diag_code:
+        # Recherche élargie en cherchant chaque symptôme individuellement
+        for s in req.symptoms:
+            code = detect_diagnostic_intent(s)
+            if code:
+                diag_code = code
+                break
+
+    if not diag_code:
+        return {
+            "found": False,
+            "message": "Symptômes non reconnus. Consultez un mécanicien pour un diagnostic précis.",
+            "suggestion": "Utilisez CarEasy pour trouver un spécialiste en diagnostic automobile.",
+        }
+
+    diag = DIAG_SYMPTOMS[diag_code]
+    _LEARN["stats"]["diag_queries"] += 1
+    _LEARN["diag_stats"][diag_code] = _LEARN["diag_stats"].get(diag_code, 0) + 1
+
+    # Scoring des causes selon les symptômes multiples
+    cause_scores = {}
+    for i, cause in enumerate(diag["causes_probables"]):
+        base_score = cause["probabilite"]
+        # Bonus si plusieurs symptômes concordants
+        bonus = min(len(req.symptoms) - 1, 3) * 2
+        cause_scores[i] = base_score + bonus
+
+    return {
+        "found":              True,
+        "code":               diag_code,
+        "titre":              diag["titre"],
+        "urgence":            diag["urgence"],
+        "symptomes_detectes": req.symptoms,
+        "causes_probables":   diag["causes_probables"],
+        "diagnostic_rapide":  diag["diagnostic_rapide"],
+        "actions_immediates": diag["actions_immediates"],
+        "domaine_recommande": diag["domaine_recommande"],
+        "cout_estimatif":     diag["cout_estimatif"],
+        "delai_recommande":   diag["delai_recommande"],
+        "vehicle":            req.vehicle,
+        "mileage":            req.mileage,
+        "note_mileage": (
+            f"À {req.mileage:,} km, vérifiez la courroie de distribution, les plaquettes et les filtres."
+            if req.mileage and req.mileage > 100000 else None
+        ),
+    }
+
+
+@app.get("/diagnostic/symptoms")
+async def list_symptoms():
+    """Retourne tous les codes de diagnostic disponibles avec leurs mots-clés."""
+    return {
+        "count": len(DIAG_SYMPTOMS),
+        "diagnostics": [
+            {
+                "code":               code,
+                "titre":              data["titre"],
+                "urgence":            data["urgence"],
+                "domaine_recommande": data["domaine_recommande"],
+                "keywords_sample":    data["keywords"][:5],
+            }
+            for code, data in DIAG_SYMPTOMS.items()
+        ]
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  AUTRES ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/feedback")
 async def feedback_endpoint(req: FeedbackRequest, bg: BackgroundTasks):
@@ -1786,22 +2290,12 @@ async def feedback_endpoint(req: FeedbackRequest, bg: BackgroundTasks):
 
 @app.get("/health")
 async def health():
-    redis_ok = ollama_ok = model_ok = db_ok = False
+    redis_ok = db_ok = False
 
     if redis_client:
         try:
             await redis_client.ping()
             redis_ok = True
-        except Exception:
-            pass
-
-    if USE_OLLAMA:
-        try:
-            async with httpx.AsyncClient(timeout=4) as c:
-                r = await c.get(f"{OLLAMA_URL}/api/tags")
-                if r.status_code == 200:
-                    ollama_ok = True
-                    model_ok  = any(OLLAMA_MODEL in m["name"] for m in r.json().get("models", []))
         except Exception:
             pass
 
@@ -1813,19 +2307,18 @@ async def health():
         pass
 
     return {
-        "status":      "ok",
-        "version":     "9.3.0",
-        "mode":        "ollama+rules+db" if ollama_ok else "rules+db",
-        "redis":       redis_ok,
-        "ollama":      ollama_ok,
-        "model":       model_ok,
-        "database":    db_ok,
-        "sessions":    len(_RAM),
-        "geo_cached":  len(_GEO),
-        "learn":       _LEARN["stats"],
-        "laravel":     LARAVEL_BASE,
-        "site":        SITE_URL,
-        "ts":          datetime.now().isoformat(),
+        "status":          "ok",
+        "version":         APP_VERSION,
+        "mode":            "autonomous (rules+nlp+db)",
+        "redis":           redis_ok,
+        "database":        db_ok,
+        "sessions":        len(_RAM),
+        "geo_cached":      len(_GEO),
+        "diag_supported":  len(DIAG_SYMPTOMS),
+        "learn":           _LEARN["stats"],
+        "laravel":         LARAVEL_BASE,
+        "site":            SITE_URL,
+        "ts":              datetime.now().isoformat(),
     }
 
 
@@ -1834,7 +2327,7 @@ async def clear_conv(cid: str):
     _RAM.pop(cid, None)
     if redis_client:
         try:
-            await redis_client.delete(f"carai9:{cid}")
+            await redis_client.delete(f"carai10:{cid}")
         except Exception:
             pass
     return {"cleared": True}
@@ -1874,13 +2367,14 @@ async def faq_ep(q: str = Query(...)):
 @app.get("/learn/stats")
 async def learn_ep():
     return {
-        "stats":       _LEARN["stats"],
-        "intents":     {k: len(v) for k, v in _LEARN["intent_clusters"].items()},
-        "bad":         len(_LEARN["bad_patterns"]),
-        "good":        len(_LEARN["good_patterns"]),
-        "corrections": len(_LEARN["faq_corrections"]),
-        "patterns":    len(_LEARN["pattern_scores"]),
-        "top_queries": sorted(
+        "stats":         _LEARN["stats"],
+        "intents":       {k: len(v) for k, v in _LEARN["intent_clusters"].items()},
+        "bad":           len(_LEARN["bad_patterns"]),
+        "good":          len(_LEARN["good_patterns"]),
+        "corrections":   len(_LEARN["faq_corrections"]),
+        "patterns":      len(_LEARN["pattern_scores"]),
+        "diag_stats":    _LEARN["diag_stats"],
+        "top_queries":   sorted(
             _LEARN["query_stats"].items(),
             key=lambda x: x[1]["count"], reverse=True
         )[:10],
@@ -1913,25 +2407,13 @@ async def test_ep():
     except Exception as e:
         results["laravel_nearby_cotonou"] = f"ERREUR: {e}"
 
-    try:
-        svcs = await api_by_domaine("Station d'essence", limit=3)
-        results["laravel_by_domaine_essence"] = f"OK — {len(svcs)} services"
-    except Exception as e:
-        results["laravel_by_domaine_essence"] = f"ERREUR: {e}"
-
-    try:
-        svcs = await api_services_all(limit=5)
-        results["laravel_services_all"] = f"OK — {len(svcs)} services"
-    except Exception as e:
-        results["laravel_services_all"] = f"ERREUR: {e}"
-
-    # Test extraction domaines
+    # Tests extraction domaine
     test_cases = [
         ("je cherche de l'essence", "Station d'essence"),
         ("je cherche de l\u2019essence", "Station d'essence"),
         ("garage mecanique pres de moi", "Garage mecanique"),
         ("je veux faire une vidange", "Changement d'huile"),
-        ("mon pneu est crevé", "Pneumatique / vulcanisation"),
+        ("mon pneu est creve", "Pneumatique / vulcanisation"),
         ("je cherche un electricien auto", "Electricien auto"),
         ("besoin d'un depanneur urgent", "Depannage / remorquage"),
     ]
@@ -1940,40 +2422,32 @@ async def test_ep():
         status = "OK" if dom == expected else f"FAIL (attendu: {expected})"
         results[f"extract_domaine_{normalize_text(text)[:30]}"] = f"{status} — '{dom}'"
 
+    # Tests diagnostic
+    diag_cases = [
+        ("ma voiture ne demarre pas", "moteur_ne_demarre_pas"),
+        ("le moteur chauffe trop", "surchauffe_moteur"),
+        ("mon pneu est a plat", "pneu_probleme"),
+        ("la pedale de frein est molle", "frein_probleme"),
+        ("voyant rouge allume tableau de bord", "voyant_allume"),
+        ("la clim ne refroidit plus", "climatisation_probleme"),
+        ("bruit etrange au virage", "bruit_suspect"),
+    ]
+    for text, expected in diag_cases:
+        code = detect_diagnostic_intent(text)
+        status = "OK" if code == expected else f"FAIL (attendu: {expected})"
+        results[f"diag_{normalize_text(text)[:30]}"] = f"{status} — '{code}'"
+
     try:
         coords = await geocode("Abomey-Calavi")
         results["geocode_abomey_calavi"] = f"OK — {coords}" if coords else "Aucun résultat"
     except Exception as e:
         results["geocode_abomey_calavi"] = f"ERREUR: {e}"
 
-    # Test recherche robuste
-    try:
-        svcs, exact = await search_services_robust(
-            domaine="Garage mecanique",
-            location=None,
-            ulat=6.3654,
-            ulng=2.4183,
-            ctx={},
-            radius=50,
-        )
-        results["search_robust_garage"] = f"OK — {len(svcs)} services, exact={exact}"
-    except Exception as e:
-        results["search_robust_garage"] = f"ERREUR: {e}"
+    results["redis"]         = "Connecté" if redis_client else "RAM actif (non bloquant)"
+    results["site_url"]      = SITE_URL
+    results["version"]       = APP_VERSION
+    results["kw2dom_count"]  = str(len(KW2DOM))
+    results["diag_count"]    = str(len(DIAG_SYMPTOMS))
+    results["mode"]          = "autonomous (no Ollama needed)"
 
-    if USE_OLLAMA:
-        try:
-            async with httpx.AsyncClient(timeout=6) as c:
-                r = await c.get(f"{OLLAMA_URL}/api/tags")
-                models = [m["name"] for m in r.json().get("models", [])] if r.status_code == 200 else []
-                results["ollama"] = f"OK — modèles: {models}"
-        except Exception as e:
-            results["ollama"] = f"ERREUR (non bloquant): {e}"
-    else:
-        results["ollama"] = "Désactivé — mode fallback actif"
-
-    results["redis"]        = "Connecté" if redis_client else "RAM actif (non bloquant)"
-    results["site_url"]     = SITE_URL
-    results["version"]      = "9.3.0"
-    results["kw2dom_count"] = str(len(KW2DOM))
-
-    return {"version": "9.3.0", "tests": results}
+    return {"version": APP_VERSION, "tests": results}
