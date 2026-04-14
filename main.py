@@ -145,6 +145,9 @@ async def startup():
             if r.status_code == 200:
                 nb = len(r.json().get("data", []))
                 print(f"[CarAI] BDD OK — {nb} services près de Cotonou")
+                
+    except Exception as e:
+        print(f"[CarAI] ATTENTION: Laravel inaccessible: {e}")
 
 
 @app.on_event("shutdown")
@@ -1304,10 +1307,6 @@ def resolve_all(text: str, ctx: Dict) -> List[Dict]:
     return []
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  MÉMOIRE (Redis + RAM)
-# ═══════════════════════════════════════════════════════════════════════════════
-
 async def mem_get(cid: str) -> Dict:
     if redis_client:
         try:
@@ -1335,11 +1334,6 @@ async def mem_save(cid: str, data: Dict):
         if turn.get("role") == "user":
             _cluster_intent(turn.get("intent", "general"), turn.get("content", ""))
     _LEARN["stats"]["total"] += 1
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  GÉOCODAGE
-# ═══════════════════════════════════════════════════════════════════════════════
 
 async def geocode(location: str) -> Optional[Tuple[float, float]]:
     key = normalize_text(location)
@@ -1427,9 +1421,6 @@ def dur(km: float) -> str:
     return f"{m} min" if m < 60 else f"{m // 60}h{m % 60:02d}"
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  API LARAVEL
-# ═══════════════════════════════════════════════════════════════════════════════
 
 async def api_nearby(
     lat: float, lng: float,
@@ -1584,10 +1575,6 @@ def fmt_rating(s: Dict) -> str:
         return f"note {r}/5 ({n} avis)"
     return ""
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  RECHERCHE ROBUSTE — 8 niveaux en cascade
-# ═══════════════════════════════════════════════════════════════════════════════
 
 async def search_services_robust(
     domaine: Optional[str],
@@ -1982,10 +1969,6 @@ def generate_reply(
     return ReplyEngine.general(msg, ctx, lang), None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  SUGGESTIONS CONTEXTUELLES
-# ═══════════════════════════════════════════════════════════════════════════════
-
 SUGG_BASE = [
     "Trouver un garage mecanique",
     "Vulcanisateur disponible",
@@ -2027,10 +2010,6 @@ def suggestions(domaine: Optional[str], location: Optional[str], ctx: Dict, inte
             final.append(s)
     return final[:5]
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ENDPOINT PRINCIPAL — v10.0
-# ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, bg: BackgroundTasks):
@@ -2184,10 +2163,6 @@ async def chat(req: ChatRequest, bg: BackgroundTasks):
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ENDPOINT DIAGNOSTIC DÉDIÉ
-# ═══════════════════════════════════════════════════════════════════════════════
-
 @app.post("/diagnostic")
 async def diagnostic_endpoint(req: DiagRequest):
     """
@@ -2266,10 +2241,6 @@ async def list_symptoms():
         ]
     }
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  AUTRES ENDPOINTS
-# ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/feedback")
 async def feedback_endpoint(req: FeedbackRequest, bg: BackgroundTasks):
