@@ -17,7 +17,7 @@ jobs:
           script: |
             cd /var/www/careasyaiservice
             if [ ! -d ".git" ]; then
-              git clone git@github.com:votre-user/careasyaiservice.git .
+              git clone git@github.com:dglink25/careasyaiservice.git .
             fi
             git pull origin main
             if [ ! -d "venv" ]; then python3 -m venv venv; fi
