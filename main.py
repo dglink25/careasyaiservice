@@ -21,15 +21,20 @@ from collections import defaultdict
 
 load_dotenv()
 
-LARAVEL_BASE    = os.getenv("LARAVEL_API_URL",  "https://careasy26.alwaysdata.net/api")
+LARAVEL_BASE    = os.getenv("LARAVEL_API_URL",  "https://careasy.cap-epac.bj/api")
 REDIS_URL       = os.getenv("REDIS_URL",        "redis://default:AZExAAIncDE1M2I2MDYzOGQyYzg0ZTNiOTNhYzg4OWU5MjUzZTlhYnAxMzcxNjk@on-turtle-37169.upstash.io:6379")
 USE_NOMINATIM   = os.getenv("USE_NOMINATIM",    "true").lower() == "true"
 GOOGLE_MAPS_KEY = os.getenv("GOOGLE_MAPS_KEY",  "")
-SITE_URL        = os.getenv("FRONTEND_URL",     "https://careasy.vercel.app")
+SITE_URL        = os.getenv("FRONTEND_URL",     "https://careasy.cap-epac.bj")
 LEARN_FILE      = os.getenv("LEARN_FILE",       "/tmp/carai_learn_v101.json")
 APP_VERSION     = "10.1.0"
 
-app = FastAPI(title="CarAI v10.1", version=APP_VERSION, docs_url="/docs")
+app = FastAPI(
+    title="CarAI v10.1",
+    version=APP_VERSION,
+    docs_url="/docs",
+    root_path="/ai-service"
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
