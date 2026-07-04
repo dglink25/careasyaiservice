@@ -21,11 +21,11 @@ from collections import defaultdict
 
 load_dotenv()
 
-LARAVEL_BASE    = os.getenv("LARAVEL_API_URL",  "https://careasy26.alwaysdata.net/api")
-REDIS_URL       = os.getenv("REDIS_URL",        "redis://default:AZExAAIncDE1M2I2MDYzOGQyYzg0ZTNiOTNhYzg4OWU5MjUzZTlhYnAxMzcxNjk@on-turtle-37169.upstash.io:6379")
+LARAVEL_BASE    = os.getenv("LARAVEL_API_URL",  "https://careasy.cap-epac.bj/api")
+REDIS_URL       = os.getenv("REDIS_URL",        "rediss://default:AZExAAIncDE1M2I2MDYzOGQyYzg0ZTNiOTNhYzg4OWU5MjUzZTlhYnAxMzcxNjk@on-turtle-37169.upstash.io:6379")
 USE_NOMINATIM   = os.getenv("USE_NOMINATIM",    "true").lower() == "true"
 GOOGLE_MAPS_KEY = os.getenv("GOOGLE_MAPS_KEY",  "")
-SITE_URL        = os.getenv("FRONTEND_URL",     "https://careasy.vercel.app")
+SITE_URL        = os.getenv("FRONTEND_URL",     "https://careasy.cap-epac.bj")
 LEARN_FILE      = os.getenv("LEARN_FILE",       "/tmp/carai_learn_v101.json")
 APP_VERSION     = "10.1.0"
 
@@ -1021,14 +1021,16 @@ FAQ: List[Dict] = [
     {
         "tags": ["inscription", "creer compte", "devenir prestataire", "inscrire entreprise",
                  "rejoindre", "soumettre dossier", "enregistrer entreprise", "creer une entreprise",
-                 "comment creer entreprise"],
+                 "comment creer entreprise", "comment créer un services", "créer services", "comment créer un service", "créer service",
+                 "publier service", "Comment publier un service"],
         "content": (
             "Pour inscrire votre entreprise sur CarEasy :\n"
             "1. Ouvrez l'application CarEasy et creez un compte.\n"
             "2. Dans la barre de navigation, appuyez sur Entreprise puis Creer.\n"
             "3. Remplissez le formulaire en 4 etapes : informations generales, documents legaux (IFU, RCCM, certificat), dirigeant et contacts, localisation.\n"
             "4. Soumettez votre dossier — validation sous 24 a 48 heures ouvrables.\n"
-            "5. Apres validation : essai gratuit de 30 jours avec 3 services maximum."
+            "5. Apres validation : essai gratuit de 30 jours avec 3 services maximum.\n"
+            "6. Créer et gérer vos services."
         )
     },
     {
@@ -1304,7 +1306,7 @@ def intent_classify(text: str, ctx: Dict) -> str:
     t  = _normalize(text)
     wc = len(t.split())
 
-    SAL = ["bonjour", "bonsoir", "salut", "hello", "hi ", "salam", "alafia", "bonne journee"]
+    SAL = ["bonjour", "Coucou", "Cc", "bonsoir", "salut", "hello", "hi ", "salam", "alafia", "bonne journee"]
     if any(s in t for s in SAL) and wc <= 5:
         return "salutation"
 
@@ -1315,7 +1317,7 @@ def intent_classify(text: str, ctx: Dict) -> str:
         return "aurevoir"
 
     if any(s in t for s in [
-        "comment tu t appelle", "qui es-tu", "c est quoi careasy",
+        "comment tu t appelle", "qui es-tu", "qui es tu", "c est quoi careasy",
         "c est quoi carai", "que peux-tu faire", "tu es qui", "presente-toi",
         "qu est-ce que careasy",
     ]):
